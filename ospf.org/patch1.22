@@ -1,0 +1,36 @@
+diff -X exclude_files -Nabur ospfd1.21/src/lsa.h ospfd1.22/src/lsa.h
+--- ospfd1.21/src/lsa.h	Tue Jan  9 13:08:56 2001
++++ ospfd1.22/src/lsa.h	Wed Jan 17 16:01:27 2001
+@@ -159,7 +159,7 @@
+  * Bellman-Ford-like calculation.
+  */
+ 
+-class TNode : public LSA, PriQElt {
++class TNode : public LSA, public PriQElt {
+ protected:
+     class Link *t_links; // transit or stub links
+     RTE	*t_dest;	// Destination routing table entry
+diff -X exclude_files -Nabur ospfd1.21/src/ospf.h ospfd1.22/src/ospf.h
+--- ospfd1.21/src/ospf.h	Tue Jan  9 13:08:56 2001
++++ ospfd1.22/src/ospf.h	Fri Jan 19 15:13:57 2001
+@@ -261,7 +261,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 21,	// Minor version number
++	vminor = 22,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -X exclude_files -Nabur ospfd1.21/src/rtrlsa.C ospfd1.22/src/rtrlsa.C
+--- ospfd1.21/src/rtrlsa.C	Tue Jan  9 13:08:56 2001
++++ ospfd1.22/src/rtrlsa.C	Wed Jan 17 16:01:11 2001
+@@ -242,7 +242,7 @@
+     maxifc = maxlen/sizeof(RtrLink);
+     if (maxifc > sz_ifmap) {
+ 	delete [] ifmap;
+-	ifmap = new (SpfIfc *)[maxifc];
++	ifmap = new SpfIfc* [maxifc];
+ 	sz_ifmap = maxifc;
+     }
+ 

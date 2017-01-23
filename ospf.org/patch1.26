@@ -1,0 +1,151 @@
+diff -X exclude_files -Nabur ospfd1.25/ospf_sim/ospfd_sim.C ospfd1.26/ospf_sim/ospfd_sim.C
+--- ospfd1.25/ospf_sim/ospfd_sim.C	Thu Feb  1 10:35:36 2001
++++ ospfd1.26/ospf_sim/ospfd_sim.C	Wed Feb 14 15:35:19 2001
+@@ -100,8 +100,6 @@
+ 
+     // Create simulation environment
+     sys = simsys = new SimSys(ctl_fd);
+-    // Start OSPF
+-    ospf = new OSPF(my_id);
+     // Log command arguments
+     sprintf(temp, "invoked: ospfd_sim %s %s", argv[1], argv[2]);
+     simsys->sys_spflog(ERR_SYS, temp);
+@@ -415,6 +413,9 @@
+ 	    sys_etime.sec = ticks/TICKS_PER_SECOND;
+ 	    sys_etime.msec = (ticks%TICKS_PER_SECOND) * 1000/TICKS_PER_SECOND;
+ 	    xmt_stamp = sys_etime;
++	    // Start OSPF, delayed so that time is initialized
++	    // correctly
++	    ospf = new OSPF(my_id);
+ 	    break;
+ 	  case SIM_TICK:
+ 	    // Advance time
+diff -X exclude_files -Nabur ospfd1.25/src/ospf.h ospfd1.26/src/ospf.h
+--- ospfd1.25/src/ospf.h	Thu Feb  1 10:35:33 2001
++++ ospfd1.26/src/ospf.h	Wed Feb 14 15:35:14 2001
+@@ -204,7 +204,7 @@
+     void do_random_refreshes();
+ 
+     // LSA origination
+-    int	self_originated(SpfArea *ap, LShdr *hdr, LSA *database_copy);
++    int	self_originated(SpfNbr *, LShdr *hdr, LSA *database_copy);
+     int	get_lsid(INrte *rte, byte lstype, SpfArea *ap, lsid_t &id);
+     seq_t ospf_get_seqno(LSA *lsap, int ls_len, int forced);
+     LSA	*lsa_reorig(SpfArea *ap, LSA *olsap, LShdr *hdr, int forced);
+@@ -265,7 +265,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 25,	// Minor version number
++	vminor = 26,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -X exclude_files -Nabur ospfd1.25/src/rte.C ospfd1.26/src/rte.C
+--- ospfd1.25/src/rte.C	Thu Feb  1 10:35:33 2001
++++ ospfd1.26/src/rte.C	Wed Feb 14 15:35:14 2001
+@@ -270,6 +270,28 @@
+     return(true);
+ }
+ 
++/* Determine whether some of the next hops go through
++ * a transit area "a". If so, when a summary-LSA associated
++ * with "a" is received, the whole routing calculation must
++ * be rerun.
++ */
++
++bool MPath::some_transit(SpfArea *a)
++
++{
++    int i;
++
++    if (!a->is_transit())
++        return(false);
++    for (i = 0; i < npaths; i++) {
++        SpfIfc *ip;
++        ip = ospf->find_ifc(NHs[i].if_addr, NHs[i].phyint);
++	if (ip && ip->area() == a)
++	    return(true);
++    }
++    return(false);
++}
++
+ /* Add an entry to an IP routing table entry. Install the
+  * prefix pointers so that the best match operations will
+  * work correctly.
+diff -X exclude_files -Nabur ospfd1.25/src/rte.h ospfd1.26/src/rte.h
+--- ospfd1.25/src/rte.h	Thu Feb  1 10:35:33 2001
++++ ospfd1.26/src/rte.h	Wed Feb 14 15:35:14 2001
+@@ -46,6 +46,7 @@
+     static MPath *addgw(MPath *, InAddr);
+     MPath *prune_phyint(int phyint);
+     bool all_in_area(class SpfArea *);
++    bool some_transit(class SpfArea *);
+ };	
+ 
+ /* Defines for type of routing table entry
+diff -X exclude_files -Nabur ospfd1.25/src/spfcalc.C ospfd1.26/src/spfcalc.C
+--- ospfd1.25/src/spfcalc.C	Thu Feb  1 10:35:33 2001
++++ ospfd1.26/src/spfcalc.C	Wed Feb 14 15:35:14 2001
+@@ -838,8 +838,11 @@
+ 	save_state();
+ 
+     // New update of transit area forces Dijkstra
+-    if (otype == RT_SPF && oa == BACKBONE && a->is_transit())
++    if ((otype == RT_SPF && oa == BACKBONE && r_mpath->some_transit(a)) ||
++	(!intra_AS() && summs)) {
+ 	ospf->full_sched = true;
++	return;
++    }
+ 
+     // Incremental summary-LSA calculations
+     run_inter_area();
+diff -X exclude_files -Nabur ospfd1.25/src/spflood.C ospfd1.26/src/spflood.C
+--- ospfd1.25/src/spflood.C	Thu Feb  1 10:35:33 2001
++++ ospfd1.26/src/spflood.C	Wed Feb 14 15:35:14 2001
+@@ -144,7 +144,7 @@
+ 	    }
+ 	    // If self-originated forces us to re-originate
+ 	    changes = (olsap ? olsap->cmp_contents(hdr) : true);
+-	    if (changes && ospf->self_originated(ap, hdr, olsap))
++	    if (changes && ospf->self_originated(this, hdr, olsap))
+ 		continue;
+ 	    /* Perform database overflow logic.
+ 	     * Discard non-default AS-external-LSAs
+diff -X exclude_files -Nabur ospfd1.25/src/spforig.C ospfd1.26/src/spforig.C
+--- ospfd1.25/src/spforig.C	Thu Feb  1 10:35:33 2001
++++ ospfd1.26/src/spforig.C	Wed Feb 14 15:35:14 2001
+@@ -30,11 +30,14 @@
+  * data that we really want to send
+  */
+ 
+-int OSPF::self_originated(SpfArea *ap, LShdr *hdr, LSA *database_copy)
++int OSPF::self_originated(SpfNbr *np, LShdr *hdr, LSA *database_copy)
+ 
+ {
+     LSA *lsap;
+     bool flush_it;
++    SpfArea *ap;
++
++    ap = np->n_ifp->area();
+ 
+     if ((ntoh32(hdr->ls_org) != my_id()) &&
+ 	(hdr->ls_type != LST_NET || !find_ifc(ntoh32(hdr->ls_id))))
+@@ -60,8 +63,15 @@
+ 	lsap->rollover = true;
+ 	age_prematurely(lsap);
+     }
+-    else
+-	lsap->refresh(ntoh32(hdr->ls_seqno));
++    else {
++        /* This strange logic to make sure that if the new
++	 * LSA has the same contents of the received LSA, but are
++	 * both different than the previous database copy, we still
++	 * flood over demand circuits.
++	 */
++        lsap->flood(np, hdr);
++	lsap->reoriginate(true);
++    }
+ 
+     return(true);
+ }

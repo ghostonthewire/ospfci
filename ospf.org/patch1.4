@@ -1,0 +1,23 @@
+diff -abur --exclude-from=exclude_files ospfd1.3/src/ospf.h ospfd1.4/src/ospf.h
+--- ospfd1.3/src/ospf.h	Wed May 10 15:51:22 2000
++++ ospfd1.4/src/ospf.h	Thu May 11 16:53:03 2000
+@@ -258,7 +258,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 3,	// Minor version number
++	vminor = 4,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -abur --exclude-from=exclude_files ospfd1.3/src/rte.C ospfd1.4/src/rte.C
+--- ospfd1.3/src/rte.C	Wed May 10 15:51:22 2000
++++ ospfd1.4/src/rte.C	Thu May 11 16:53:03 2000
+@@ -120,6 +120,7 @@
+ 	    else
+ 		continue;
+ 	}
++	if (n_paths < MAXPATH)
+ 	paths[n_paths++] = mp1->NHs[i];
+     }
+     // Complete second multipath entry

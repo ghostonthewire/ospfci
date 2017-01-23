@@ -1,0 +1,35 @@
+diff -Nabur --exclude-from=exclude_files ospfd1.11/src/ospf.h ospfd1.12/src/ospf.h
+--- ospfd1.11/src/ospf.h	Wed Aug 23 16:09:52 2000
++++ ospfd1.12/src/ospf.h	Wed Aug 23 16:20:01 2000
+@@ -258,7 +258,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 11,	// Minor version number
++	vminor = 12,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -Nabur --exclude-from=exclude_files ospfd1.11/src/rtrlsa.C ospfd1.12/src/rtrlsa.C
+--- ospfd1.11/src/rtrlsa.C	Wed Aug 23 16:09:52 2000
++++ ospfd1.12/src/rtrlsa.C	Wed Aug 23 16:20:01 2000
+@@ -299,6 +299,10 @@
+ 	    rlp = ip->rl_insert(rtrhdr, rlp);
+     }
+ 
++    // Add area's host routes
++    if (n_active_if != 0)
++        rlp = rl_insert_hosts(this, rtrhdr, rlp);
++
+     /* If no active interfaces to area, just flush
+      * LSA. Host addresses will get added to other areas
+      * automatically.
+@@ -308,8 +312,6 @@
+ 	return;
+     }
+ 
+-    // Add area's host routes
+-    rlp = rl_insert_hosts(this, rtrhdr, rlp);
+     // If first active area, advertise orphaned hosts
+     if (this == ospf->first_area) {
+         AreaIterator aiter(ospf);

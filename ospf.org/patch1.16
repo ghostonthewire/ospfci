@@ -1,0 +1,481 @@
+diff -Nabur --exclude-from=exclude_files ospfd1.15/linux/ospfd_linux.C ospfd1.16/linux/ospfd_linux.C
+--- ospfd1.15/linux/ospfd_linux.C	Fri Sep 22 11:44:17 2000
++++ ospfd1.16/linux/ospfd_linux.C	Wed Oct 11 10:44:07 2000
+@@ -24,7 +24,14 @@
+ #include <sys/resource.h>
+ #include <unistd.h>
+ #include <tcl.h>
++#if LINUX_VERSION_CODE >= LINUX22
++#include <asm/types.h>
++#include <sys/socket.h>
++#include <linux/netlink.h>
++#include <linux/rtnetlink.h>
++#else
+ #include <sys/socket.h>
++#endif
+ #include <net/route.h>
+ #include <sys/ioctl.h>
+ #include <sys/uio.h>
+@@ -121,6 +128,10 @@
+ 	    FD_SET(ospfd_sys->igmpfd, &fdset);
+ 	    n_fd = MAX(n_fd, ospfd_sys->igmpfd);
+ 	}
++	if (ospfd_sys->rtsock != -1) {
++	    FD_SET(ospfd_sys->rtsock, &fdset);
++	    n_fd = MAX(n_fd, ospfd_sys->rtsock);
++	}
+ 	// Process any pending timers
+ 	ospf->tick();
+ 	// Time till next timer firing
+@@ -156,6 +167,9 @@
+ 	if (ospfd_sys->igmpfd != -1 &&
+ 	    FD_ISSET(ospfd_sys->igmpfd, &fdset))
+ 	    ospfd_sys->raw_receive(ospfd_sys->igmpfd);
++	if (ospfd_sys->rtsock != -1 &&
++	    FD_ISSET(ospfd_sys->rtsock, &fdset))
++	    ospfd_sys->netlink_receive(ospfd_sys->rtsock);
+ 	// Process monitor queries and responses
+ 	ospfd_sys->process_mon_io(&fdset, &wrset);
+     }
+@@ -226,6 +240,85 @@
+     }
+ }
+ 
++/* Received a packet over the rtnetlink interface.
++ * This indicates that an interface has changed state, or that
++ * a interface address has been added or deleted.
++ * Note: because of some oddities in the Linux kernel, sometimes
++ * adding an interface address generates bogus DELADDRs, resulting
++ * in an extra reconfiguration.
++ *
++ * Changes in interface flags potentially cause the OSPF
++ * API routines phy_up() or phy_down() to be called. All other
++ * interface or address changes simply cause OSPF to be reconfigured.
++ *
++ * The netlink interface is available only in Linux 2.2 or later.
++ */
++
++#if LINUX_VERSION_CODE >= LINUX22
++void LinuxOspfd::netlink_receive(int fd)
++
++{
++    int plen;
++    unsigned int fromlen;
++    nlmsghdr *msg;
++
++    plen = recvfrom(fd, buffer, sizeof(buffer), 0, 0, &fromlen);
++    if (plen <= 0) {
++        syslog(LOG_ERR, "rtnetlink recvfrom: %m");
++	return;
++    }
++    msg = (nlmsghdr *)buffer;
++    switch (msg->nlmsg_type) {
++        in_addr in;
++	ifinfomsg *ifinfo;
++	ifaddrmsg *ifm;
++	rtattr *rta;
++	int rta_len;
++	BSDPhyInt *phyp;
++      case RTM_NEWLINK:	// Interface flags change
++	ifinfo = (ifinfomsg *)NLMSG_DATA(msg);
++	syslog(LOG_NOTICE, "Ifc change IfIndex %d flags 0x%x",
++	       ifinfo->ifi_index, ifinfo->ifi_flags);
++	if ((phyp = phys[ifinfo->ifi_index]))
++	    set_flags(phyp, (short) ifinfo->ifi_flags);
++	else if ((ifinfo->ifi_flags & IFF_LOOPBACK) == 0)
++	    read_config();
++	break;
++      case RTM_DELLINK:	// Interface deletion
++	ifinfo = (ifinfomsg *)NLMSG_DATA(msg);
++	syslog(LOG_NOTICE, "Ifc deleted IfIndex %d",
++	       ifinfo->ifi_index);
++	read_config();
++	break;
++      case RTM_NEWADDR: // Interface address add/delete
++      case RTM_DELADDR:
++	ifm = (ifaddrmsg *)NLMSG_DATA(msg);
++	rta_len = IFA_PAYLOAD(msg);
++	for (rta = IFA_RTA(ifm); RTA_OK(rta, rta_len); 
++	     rta = RTA_NEXT(rta, rta_len)) {
++	    switch(rta->rta_type) {
++	      case IFA_ADDRESS:
++		memcpy(&in.s_addr, RTA_DATA(rta), 4);
++		break;
++	      default:
++		break;
++	    }
++	}
++	syslog(LOG_NOTICE, "Interface addr change %s", inet_ntoa(in));
++	read_config();
++	break;
++      default:
++	break;
++    }
++}
++#else
++void LinuxOspfd::netlink_receive(int)
++
++{
++}
++#endif
++
++
+ /* Update the program's notion of time, which is in milliseconds
+  * since program start. Wait until receiving the timer signal
+  * to update a full second.
+@@ -297,10 +390,26 @@
+     // We will supply headers on output
+     int hincl = 1;
+     setsockopt(netfd, IPPROTO_IP, IP_HDRINCL, &hincl, sizeof(hincl));
++    rtsock = -1;
+ #if LINUX_VERSION_CODE >= LINUX22
+     // Request notification of receiving interface
+     int pktinfo = 1;
+     setsockopt(netfd, IPPROTO_IP, IP_PKTINFO, &pktinfo, sizeof(pktinfo));
++    // Open rtnetlink socket
++    nlm_seq = 0;
++    sockaddr_nl addr;
++    if ((rtsock = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE)) == -1) {
++	syslog(LOG_ERR, "Failed to create rtnetlink socket: %m");
++	exit(1);
++    }
++    addr.nl_family = AF_NETLINK;
++    addr.nl_pad = 0;
++    addr.nl_pid = 0;
++    addr.nl_groups = (RTMGRP_LINK | RTMGRP_IPV4_IFADDR);
++    if (bind(rtsock, (sockaddr *)&addr, sizeof(addr)) < 0) {
++	syslog(LOG_ERR, "Failed to bind to rtnetlink socket: %m");
++	exit(1);
++    }
+ #endif
+     // Open ioctl socket
+     if ((udpfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+@@ -356,6 +465,7 @@
+     if (changing_routerid)
+         return;
+ 
++    syslog(LOG_NOTICE, "reconfiguring");
+     new_router_id = 0;
+     interp = Tcl_CreateInterp();
+     // Install C-language TCl commands
+@@ -493,6 +603,7 @@
+ 	// Ignore loopback interfaces
+ 	// Also ignore "down" interfaces
+ 	// Get interface flags
++	short ifflags;
+ 	memcpy(ifr.ifr_name, ifrp->ifr_name, sizeof(ifr.ifr_name));
+ 	if (ioctl(udpfd, SIOCGIFFLAGS, (char *)&ifr) < 0) {
+ 	    syslog(LOG_ERR, "SIOCGIFFLAGS Failed: %m");
+@@ -500,14 +611,13 @@
+ 	}
+ 	if ((ifr.ifr_flags & IFF_LOOPBACK) != 0)
+ 	    continue;
+-	if ((ifr.ifr_flags & IFF_UP) == 0)
+-	    continue;
++	ifflags = ifr.ifr_flags;
+ #if LINUX_VERSION_CODE >= LINUX22
+ 	int ifindex;
+ 	// Get interface index
+ 	memcpy(ifr.ifr_name, ifrp->ifr_name, sizeof(ifr.ifr_name));
+ 	if (ioctl(udpfd, SIOCGIFINDEX, (char *)&ifr) < 0) {
+-	    syslog(LOG_ERR, "SIOCGIFFLAGS Failed: %m");
++	    syslog(LOG_ERR, "SIOCGIFINDEX Failed: %m");
+ 	    exit(1);
+ 	}
+ 	ifindex = ifr.ifr_ifindex;
+@@ -528,13 +638,15 @@
+ #else
+ 	    phyp->phyint = ifindex;
+ #endif
++	    phyp->flags = 0;
+ 	    phyints.add(phyp);
+ 	    // May have multiple interfaces attached to same physical
+ 	    // net
+ 	    if (!phys[phyp->phyint])
+ 	        phys[phyp->phyint] = phyp;
+ 	}
+-	phyp->flags = ifr.ifr_flags;
++	if (!memchr(ifrp->ifr_name, ':', sizeof(ifrp->ifr_name)))
++	    set_flags(phyp, ifflags);
+ 	insock = (sockaddr_in *) &ifrp->ifr_addr;
+ 	addr = phyp->addr = ntoh32(insock->sin_addr.s_addr);
+ 	// Get subnet mask
+@@ -566,6 +678,25 @@
+     }
+ 
+     delete [] ifcbuf;
++}
++
++/* Set the interface flags, If the IFF_UP flag
++ * has changed, call the appropriate OSPFD API
++ * routine.
++ */
++
++void LinuxOspfd::set_flags(BSDPhyInt *phyp, short flags)
++
++{
++    short old_flags=phyp->flags;
++
++    phyp->flags = flags;
++    if (((old_flags^flags) & IFF_UP) != 0 && ospf) {
++        if ((flags & IFF_UP) != 0)
++	    ospf->phy_up(phyp->phyint);
++	else
++	    ospf->phy_down(phyp->phyint);
++    }
+ }
+ 
+ /* Add to the list of directly attached prefixes. These
+diff -Nabur --exclude-from=exclude_files ospfd1.15/linux/ospfd_linux.h ospfd1.16/linux/ospfd_linux.h
+--- ospfd1.15/linux/ospfd_linux.h	Fri Sep 22 11:44:17 2000
++++ ospfd1.16/linux/ospfd_linux.h	Wed Oct 11 10:44:07 2000
+@@ -17,7 +17,7 @@
+  *   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+  */
+ 
+-#define LINUX22 131584
++#define LINUX22 0x20200
+ 
+ class LinuxOspfd : public Linux {
+     enum { 
+@@ -26,6 +26,7 @@
+     int netfd;	// File descriptor used to send and receive
+     int igmpfd; // File descriptor for multicast routing
+     int udpfd;	// UDP file descriptor for ioctl's
++    int rtsock; // rtnetlink file descriptor
+     timeval last_time; // Last return from gettimeofday
+     int next_phyint; // Next phyint value
+     PatTree phyints; // Physical interfaces
+@@ -33,6 +34,7 @@
+     AVLtree directs; // Directly attached prefixes
+     class BSDPhyInt *phys[MAXIFs];
+     rtentry m;
++    uns32 nlm_seq;
+     FILE *logstr;
+     bool changing_routerid;
+     bool change_complete;
+@@ -67,7 +69,9 @@
+     int get_phyint(InAddr);
+     bool parse_interface(char *, in_addr &, BSDPhyInt * &);
+     void raw_receive(int fd);
++    void netlink_receive(int fd);
+     void process_routerid_change();
++    void set_flags(class BSDPhyInt *, short flags);
+     friend int main(int argc, char *argv[]);
+     friend int SendInterface(void *,struct Tcl_Interp *, int,char *[]);
+     friend void quit(int);
+diff -Nabur --exclude-from=exclude_files ospfd1.15/linux/system.C ospfd1.16/linux/system.C
+--- ospfd1.15/linux/system.C	Fri Sep 22 11:44:17 2000
++++ ospfd1.16/linux/system.C	Wed Oct 11 10:44:07 2000
+@@ -26,6 +26,10 @@
+ #include <unistd.h>
+ #include <string.h>
+ #include <sys/socket.h>
++#if LINUX_VERSION_CODE >= LINUX22
++#include <linux/netlink.h>
++#include <linux/rtnetlink.h>
++#endif
+ #include <sys/ioctl.h>
+ #include <net/route.h>
+ #include <net/if.h>
+@@ -137,17 +141,12 @@
+ bool LinuxOspfd::phy_operational(int phyint)
+ 
+ {
+-    ifreq ifr;
+     BSDPhyInt *phyp;
+ 
+     if (phyint == -1)
+         return(false);
+     if (!(phyp = phys[phyint]))
+         return(false);
+-    memcpy(ifr.ifr_name, phyp->key, sizeof(ifr.ifr_name));
+-    if (ioctl(udpfd, SIOCGIFFLAGS, (char *)&ifr) >= 0)
+-	phyp->flags = ifr.ifr_flags;
+-    
+     return((phyp->flags & IFF_UP) != 0);
+ }
+ 
+@@ -278,6 +277,8 @@
+     int optname;
+ 
+     phyp = phys[phyint];
++    if (igmpfd == -1)
++        return;
+     if ((phyp->flags & IFF_MULTICAST) == 0)
+ 	return;
+     vif.vifc_vifi = phyint;
+@@ -291,6 +292,7 @@
+         syslog(LOG_ERR, "MRT_ADD/DEL_VIF failed: %m");
+ }
+ 
++#if LINUX_VERSION_CODE < LINUX22
+ /* Prepare to send a routing table add/delete to the Linux
+  * kernel.
+  */
+@@ -381,6 +383,153 @@
+     if (-1 == ioctl(udpfd, SIOCDELRT, (char *)&m))
+ 	syslog(LOG_ERR, "SIOCDELRT: %m");
+ }
++#else
++/* On Linux 2.2, add and delete routing table entries
++ * via the rtnetlink interface. Note that we are setting
++ * rtm_protocol to 89. The Linux kernel doesn't do anything
++ * special with the value, but it allows us to delete entries
++ * freely without worrying that we will bash some other
++ * routing daemon's entries. We should register the rtm_protocol
++ * value with the Linux guys.
++ */
++
++void LinuxOspfd::rtadd(InAddr net, InMask mask, MPath *mpp, 
++		     MPath *ompp, bool reject)
++
++{
++    nlmsghdr *nlm;
++    rtmsg *rtm;
++    rtattr *rta_dest;
++    rtattr *rta_gw;
++    int size;
++    int prefix_length;
++
++    if (directs.find(net, mask) || !mpp) {
++	rtdel(net, mask, ompp);
++	return;
++    }
++
++    // Change mask to prefix length
++    for (prefix_length = 32; prefix_length > 0; prefix_length--) {
++	if ((mask & (1 << (32-prefix_length))) != 0)
++	    break;
++    }
++    // Calculate size of routing message
++    size = NLMSG_SPACE(sizeof(*rtm)); // Routing message itself
++    if (prefix_length > 0)
++	size += RTA_SPACE(4);	// For destination
++    if (!reject)
++	size += RTA_SPACE(4);	// For next hop
++    // Allocate routing table message, and find place for
++    // individual data items
++    nlm = (nlmsghdr *) new char[size];
++    nlm->nlmsg_len = size;
++    nlm->nlmsg_type = RTM_NEWROUTE;
++    nlm->nlmsg_flags = NLM_F_REQUEST|NLM_F_REPLACE|NLM_F_CREATE;
++    nlm->nlmsg_seq = nlm_seq++;
++    nlm->nlmsg_pid = 0;
++    rtm = (rtmsg *) NLMSG_DATA(nlm);
++    rtm->rtm_family = AF_INET;
++    rtm->rtm_dst_len = prefix_length;
++    rtm->rtm_src_len = 0;
++    rtm->rtm_table = 0;
++    rtm->rtm_protocol = PROT_OSPF;
++    rtm->rtm_scope = RT_SCOPE_UNIVERSE;
++    rtm->rtm_type = RTN_UNICAST;
++    rtm->rtm_flags = 0;
++    if (prefix_length > 0) {
++        uns32 swnet;
++	int attrlen;
++	rta_dest = (rtattr *) RTM_RTA(rtm);
++	rta_dest->rta_len = attrlen = RTA_SPACE(4);
++	rta_dest->rta_type = RTA_DST;
++	swnet = hton32(net);
++	memcpy(RTA_DATA(rta_dest), &swnet, sizeof(swnet));
++	rta_gw = (rtattr *) RTA_NEXT(rta_dest, attrlen);
++    }
++    else
++	rta_gw = (rtattr *) RTM_RTA(rtm);
++    // Reject route? 
++    if (reject) {
++	rtm->rtm_scope = RT_SCOPE_HOST;
++	rtm->rtm_type = RTN_UNREACHABLE;
++    }
++    else {
++	InAddr gw;
++	BSDPhyInt *phyp=0;
++	int phyint;
++	gw = hton32(mpp->NHs[0].gw);
++	if ((phyint = mpp->NHs[0].phyint) != -1)
++	    phyp = phys[phyint];
++	if (phyp && (phyp->flags & IFF_POINTOPOINT) != 0){
++	    // Fill in gw attribute
++	    rta_gw->rta_len = RTA_SPACE(sizeof(phyint));
++	    rta_gw->rta_type = RTA_OIF;
++	    memcpy(RTA_DATA(rta_gw), &phyint, sizeof(phyint));
++	}
++	else {
++	    // Fill in gw attribute
++	    rta_gw->rta_len = RTA_SPACE(4);
++	    rta_gw->rta_type = RTA_GATEWAY;
++	    memcpy(RTA_DATA(rta_gw), &gw, sizeof(gw));
++	}
++    }
++
++    // Add through routing socket send
++    if (-1 == send(rtsock, nlm, size, 0))
++	syslog(LOG_ERR, "add route through routing socket: %m");
++}
++
++void LinuxOspfd::rtdel(InAddr net, InMask mask, MPath *)
++
++{
++    nlmsghdr *nlm;
++    rtmsg *rtm;
++    rtattr *rta_dest;
++    int size;
++    int prefix_length;
++
++    // Change mask to prefix length
++    for (prefix_length = 32; prefix_length > 0; prefix_length--) {
++	if ((mask & (1 << (32-prefix_length))) != 0)
++	    break;
++    }
++    // Calculate size of routing message
++    size = NLMSG_SPACE(sizeof(*rtm)); // Routing message itself
++    if (prefix_length > 0)
++	size += RTA_SPACE(4);	// For destination
++    // Allocate routing table message, and find place for
++    // individual data items
++    nlm = (nlmsghdr *) new char[size];
++    nlm->nlmsg_len = size;
++    nlm->nlmsg_type = RTM_DELROUTE;
++    nlm->nlmsg_flags = NLM_F_REQUEST;
++    nlm->nlmsg_seq = nlm_seq++;
++    nlm->nlmsg_pid = 0;
++    rtm = (rtmsg *) NLMSG_DATA(nlm);
++    rtm->rtm_family = AF_INET;
++    rtm->rtm_dst_len = prefix_length;
++    rtm->rtm_src_len = 0;
++    rtm->rtm_table = 0;
++    rtm->rtm_protocol = PROT_OSPF;
++    rtm->rtm_scope = RT_SCOPE_UNIVERSE;
++    rtm->rtm_type = RTN_UNICAST;
++    rtm->rtm_flags = 0;
++    if (prefix_length > 0) {
++        uns32 swnet;
++	int attrlen;
++	rta_dest = (rtattr *) RTM_RTA(rtm);
++	rta_dest->rta_len = attrlen = RTA_SPACE(4);
++	rta_dest->rta_type = RTA_DST;
++	swnet = hton32(net);
++	memcpy(RTA_DATA(rta_dest), &swnet, sizeof(swnet));
++    }
++
++    // Delete through routing socket send
++    if (-1 == send(rtsock, nlm, size, 0))
++	syslog(LOG_ERR, "del route through routing socket: %m");
++}
++#endif
+ 
+ /* Add a multicast routing table entry to the kernel.
+  */
+diff -Nabur --exclude-from=exclude_files ospfd1.15/src/ospf.h ospfd1.16/src/ospf.h
+--- ospfd1.15/src/ospf.h	Fri Sep 22 11:44:16 2000
++++ ospfd1.16/src/ospf.h	Wed Oct 11 10:44:06 2000
+@@ -258,7 +258,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 15,	// Minor version number
++	vminor = 16,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code

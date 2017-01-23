@@ -1,0 +1,49 @@
+diff -Nabur --exclude-from=exclude_files ospfd1.14/src/lsa.h ospfd1.15/src/lsa.h
+--- ospfd1.14/src/lsa.h	Fri Sep 22 11:11:50 2000
++++ ospfd1.15/src/lsa.h	Fri Sep 22 11:44:16 2000
+@@ -177,6 +177,7 @@
+     MPath *t_mpath;	// Multipath entry
+ public:
+     TNode(class SpfArea *, LShdr *, int blen);
++    virtual ~TNode();
+     void tlp_link(TLink *tlp);
+     void unlink();
+     void dijk_install();
+diff -Nabur --exclude-from=exclude_files ospfd1.14/src/ospf.h ospfd1.15/src/ospf.h
+--- ospfd1.14/src/ospf.h	Fri Sep 22 11:11:50 2000
++++ ospfd1.15/src/ospf.h	Fri Sep 22 11:44:16 2000
+@@ -258,7 +258,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 12,	// Minor version number
++	vminor = 15,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -Nabur --exclude-from=exclude_files ospfd1.14/src/rtrlsa.C ospfd1.15/src/rtrlsa.C
+--- ospfd1.14/src/rtrlsa.C	Fri Sep 22 11:11:50 2000
++++ ospfd1.15/src/rtrlsa.C	Fri Sep 22 11:44:16 2000
+@@ -589,6 +589,22 @@
+     }
+ }
+ 
++/* Destructor for transit nodes. Must return all the transit
++ * and stub links to the heap.
++ */
++
++TNode::~TNode()
++
++{
++    Link *lp;
++    Link *nextl;
++
++    for (lp = t_links; lp; lp = nextl) {
++	nextl = lp->l_next;
++	delete lp;
++    }
++}
++
+ /* Build a router-LSA in network format, based on the internal
+  * parsed version. Only called if "exception" not set, meaning that
+  * there was nothing unusual about the router-LSA.

@@ -1,0 +1,1864 @@
+diff -X exclude_files -Nabur ospfd1.28/linux/Makefile ospfd/linux/Makefile
+--- ospfd1.28/linux/Makefile	Fri Mar 16 14:06:21 2001
++++ ospfd/linux/Makefile	Fri Mar 30 12:54:31 2001
+@@ -24,6 +24,7 @@
+ 	  mospf.o \
+ 	  nbrfsm.o \
+ 	  netlsa.o \
++	  opqlsa.o \
+ 	  ospf.o \
+ 	  pat.o \
+ 	  phyint.o \
+diff -X exclude_files -Nabur ospfd1.28/linux/linux.C ospfd/linux/linux.C
+--- ospfd1.28/linux/linux.C	Fri Mar 16 14:06:21 2001
++++ ospfd/linux/linux.C	Tue Apr  3 12:03:56 2001
+@@ -157,6 +157,7 @@
+ {
+     close(conn->monfd());
+     monfds.remove(conn);
++    ospf->register_for_opqs(conn->monfd(), true);
+     delete conn;
+ }
+ 
+diff -X exclude_files -Nabur ospfd1.28/linux/lsa_prn.C ospfd/linux/lsa_prn.C
+--- ospfd1.28/linux/lsa_prn.C	Fri Mar 16 14:06:21 2001
++++ ospfd/linux/lsa_prn.C	Tue Apr  3 12:07:29 2001
+@@ -72,6 +72,7 @@
+ 	void print_asbr_lsa(byte *, int);
+ 	void print_asex_lsa(byte *, int);
+ 	void print_gm_lsa(byte *, int);
++	void print_opq_lsa(byte *, int);
+       case LST_RTR:
+ 	print_rtr_lsa(body, len);
+ 	break;
+@@ -90,10 +91,15 @@
+       case LST_GM:
+ 	print_gm_lsa(body, len);
+ 	break;
++      case LST_LINK_OPQ:
++      case LST_AREA_OPQ:
++      case LST_AS_OPQ:
++	print_opq_lsa(body, len);
++	break;
+       default:
+ 	break;
+     }
+-};
++}
+ 
+ 
+ /* Print out the body of a router-LSA.
+@@ -286,5 +292,24 @@
+ 	printf("\t\tLS type:\t%d\n", ntoh32(ref->ls_type));
+ 	in = *((in_addr *) &ref->ls_id);
+ 	printf("\t\tLink State ID:\t%s\n", inet_ntoa(in));
++    }
++}
++
++/* Print out the body of an opaque-LSA.
++ */
++
++void print_opq_lsa(byte *body, int len)
++
++{
++    byte *end;
++    int	i;
++
++    end = body + len;
++
++    printf("\t// Opaque-LSA body\n\t");
++    for (i=0; i < len; i++) {
++	if (i != 0 && (i % 16) == 0)
++	    printf("\r\n\t");
++	printf("%02x ", body[i]);
+     }
+ }
+diff -X exclude_files -Nabur ospfd1.28/linux/ospfd_browser.C ospfd/linux/ospfd_browser.C
+--- ospfd1.28/linux/ospfd_browser.C	Fri Mar 16 14:06:23 2001
++++ ospfd/linux/ospfd_browser.C	Thu Apr  5 15:03:07 2001
+@@ -53,6 +53,7 @@
+ void get_rttbl();
+ void display_html(char *);
+ void display_error(char *);
++void get_opaques();
+ 
+ const int OSPFD_MON_PORT = 12767;
+ 
+@@ -94,6 +95,8 @@
+ extern char *expand_lsa_top;
+ extern char *expand_lsa_bottom;
+ extern char *error_page;
++extern char *opaque_page_top;
++extern char *opaque_row;
+ 
+ /* Class used to store the value-pairs returned
+  * by the html server.
+@@ -271,6 +274,8 @@
+ 	    select_lsa();
+ 	else if (strncmp(command, "adv", 3) == 0)
+ 	    get_lsa();
++	else if (strncmp(command, "opqs", 4) == 0)
++	    get_opaques();
+     }
+ 
+     display_html(page_footer);
+@@ -544,6 +549,15 @@
+ 	case LST_GM:
+ 	    addVP(&pairs, "ls_type", "Group member");
+ 	    break;
++	case LST_LINK_OPQ:
++	    addVP(&pairs, "ls_type", "Link Opaque");
++	    break;
++	case LST_AREA_OPQ:
++	    addVP(&pairs, "ls_type", "Area Opaque");
++	    break;
++	case LST_AS_OPQ:
++	    addVP(&pairs, "ls_type", "AS Opaque");
++	    break;
+ 	}
+ 	in = *((in_addr *) &lshdr->ls_id);
+ 	addVP(&pairs, "ls_id", inet_ntoa(in));
+@@ -573,6 +587,111 @@
+     display_html(database_page_bottom);
+ }
+ 
++/* Get the Opaque-LSAs, through the registration interface.
++ */
++
++void get_opaques()
++
++{
++    MonMsg req;
++    int mlen;
++    int n_lsas = 0;
++    uns32 xsum = 0;
++
++    display_html(opaque_page_top);
++    req.hdr.version = OSPF_MON_VERSION;
++    req.hdr.retcode = 0;
++    req.hdr.exact = 0;
++    mlen = sizeof(MonHdr);
++    req.hdr.id = hton16(id++);
++    if (!monpkt->sendpkt_suspend(&req, MonReq_OpqReg, 0, mlen)) {
++        display_error("Send failed");
++	exit(0);
++    }
++
++    while (1) {
++	MonHdr *mhdr;
++	MonMsg *m;
++	LShdr *lshdr;
++	in_addr in;
++	uns16 type;
++	uns16 subtype;
++	age_t age;
++	char *ptr;
++
++	req.hdr.version = OSPF_MON_VERSION;
++	req.hdr.retcode = 0;
++	req.hdr.exact = 0;
++	mlen = sizeof(MonHdr);
++	req.hdr.id = hton16(id++);
++	if (!monpkt->sendpkt_suspend(&req, MonReq_OpqNext, 0, mlen)) {
++            display_error("Send failed");
++	    exit(0);
++	}
++
++	if (monpkt->rcv_suspend((void **)&mhdr, type, subtype) == -1) {
++            display_error("Receive failed");
++	    exit(0);
++	}
++
++	m = (MonMsg *) mhdr;
++	if (m->hdr.retcode != 0)
++	    break;
++	addVP(&pairs, "phyint", "n/a");
++	addVP(&pairs, "if_addr", "n/a");
++	addVP(&pairs, "area_id", "n/a");
++
++	n_lsas++;
++	lshdr = (LShdr *) (((char *) m) + sizeof(MonHdr) + sizeof(OpqRsp));
++	xsum += ntoh16(lshdr->ls_xsum);
++	sprintf(buffer, "%d", lshdr->ls_type);
++	addVP(&pairs, "ls_typeno", buffer);
++	// Print out Link state header
++	switch (lshdr->ls_type) {
++	case LST_LINK_OPQ:
++	    addVP(&pairs, "ls_type", "Link Opaque");
++	    sprintf(buffer, "%d", ntoh32(m->body.opqrsp.phyint));
++	    addVP(&pairs, "phyint", buffer);
++	    in = *((in_addr *) &m->body.opqrsp.if_addr);
++	    addVP(&pairs, "if_addr", inet_ntoa(in));
++	    break;
++	case LST_AREA_OPQ:
++	    addVP(&pairs, "ls_type", "Area Opaque");
++	    in = *((in_addr *) &m->body.opqrsp.a_id);
++	    addVP(&pairs, "area_id", inet_ntoa(in));
++	    break;
++	case LST_AS_OPQ:
++	    addVP(&pairs, "ls_type", "AS Opaque");
++	    break;
++	}
++	in = *((in_addr *) &lshdr->ls_id);
++	addVP(&pairs, "ls_id", inet_ntoa(in));
++	in = *((in_addr *) &lshdr->ls_org);
++	addVP(&pairs, "adv_rtr", inet_ntoa(in));
++	sprintf(buffer, "0x%08x", ntoh32(lshdr->ls_seqno));
++	addVP(&pairs, "seqno", buffer);
++	sprintf(buffer, "0x%04x", ntoh16(lshdr->ls_xsum));
++	addVP(&pairs, "lsa_xsum", buffer);
++	sprintf(buffer, "%d", ntoh16(lshdr->ls_length));
++	addVP(&pairs, "lsa_len", buffer);
++	ptr = buffer;
++	age = ntoh16(lshdr->ls_age);
++	if ((age & DoNotAge) != 0) {
++	    age &= ~DoNotAge;
++	    strcpy(buffer, "DNA+");
++	    ptr += strlen(buffer);
++	}
++	sprintf(ptr, "%d", age);
++	addVP(&pairs, "ls_age", buffer);
++	display_html(opaque_row);
++    }
++    sprintf(buffer, "%d", n_lsas);
++    addVP(&pairs, "n_lsas", buffer);
++    sprintf(buffer, "0x%x", xsum);
++    addVP(&pairs, "area_xsum", buffer);
++    display_html(database_page_bottom);
++}
++
+ /* Ask the user to select a particular LSA to
+  * expand.
+  */
+@@ -1274,6 +1393,48 @@
+ </table>\n\
+ </table>\n";
+ 
++/* The pages used to display the Opaque-LSAs
++ */
++
++char *opaque_page_top = "\
++<table>\n\
++<tr>\n\
++<td width=200>\n\
++Router $router_id$'s link-state database for OSPF\n\
++Area $area_id$. AS-external-LSAs are not included.\n\
++</td>\n\
++</tr>\n\
++<tr>\n\
++<td>\n\
++</center>\n\
++<table border=1>\n\
++<tr>\n\
++<th>Phyint</th>\n\
++<th>If Address</th>\n\
++<th>Area</th>\n\
++<th>LS type</th>\n\
++<th>LS ID</th>\n\
++<th>Adv. Rtr.</th>\n\
++<th>LS Seqno</th>\n\
++<th>Xsum</th>\n\
++<th>Length</th>\n\
++<th>Age</th>\n\
++</tr>\n";
++
++char *opaque_row = "\
++<tr>\n\
++<td>$phyint$</a></td>\n\
++<td>$if_addr$</a></td>\n\
++<td>$area_id$</a></td>\n\
++<td>$ls_type$</a></td>\n\
++<td>$ls_id$</td>\n\
++<td>$adv_rtr$</td>\n\
++<td>$seqno$</td>\n\
++<td>$lsa_xsum$</td>\n\
++<td>$lsa_len$</td>\n\
++<td>$ls_age$</td>\n\
++</tr>\n";
++
+ /* Pages used to select a given LSA for display.
+  * Top is followed by "<option>area" fields,
+  * and then the bottom.
+@@ -1473,7 +1634,8 @@
+ <a href=\"/cgi-bin/ospfd_browser?command=statistics&addr=$addr$&port=$port$\">Statistics</a> |\n\
+ <a href=\"/cgi-bin/ospfd_browser?command=lsa&addr=$addr$&port=$port$\">LSA expansion</a> |\n\
+ <a href=\"/cgi-bin/ospfd_browser?command=ases&addr=$addr$&port=$port$\">AS externals</a> |\n\
+-<a href=\"/cgi-bin/ospfd_browser?command=route&addr=$addr$&port=$port$\">Routing table</a>\n\
++<a href=\"/cgi-bin/ospfd_browser?command=route&addr=$addr$&port=$port$\">Routing table</a> |\n\
++<a href=\"/cgi-bin/ospfd_browser?command=opqs&addr=$addr$&port=$port$\">Opaque-LSAs</a>\n\
+ </center>\n\
+ </td>\n\
+ </tr>\n\
+diff -X exclude_files -Nabur ospfd1.28/ospf_sim/linux/Makefile ospfd/ospf_sim/linux/Makefile
+--- ospfd1.28/ospf_sim/linux/Makefile	Fri Mar 16 14:06:26 2001
++++ ospfd/ospf_sim/linux/Makefile	Fri Mar 30 13:22:27 2001
+@@ -27,6 +27,7 @@
+ 	  mtrace.o \
+ 	  nbrfsm.o \
+ 	  netlsa.o \
++	  opqlsa.o \
+ 	  ospf.o \
+ 	  pat.o \
+ 	  phyint.o \
+diff -X exclude_files -Nabur ospfd1.28/ospf_sim/x86/Makefile ospfd/ospf_sim/x86/Makefile
+--- ospfd1.28/ospf_sim/x86/Makefile	Fri Mar 16 14:06:24 2001
++++ ospfd/ospf_sim/x86/Makefile	Fri Mar 30 13:23:26 2001
+@@ -27,6 +27,7 @@
+ 	  mtrace.o \
+ 	  nbrfsm.o \
+ 	  netlsa.o \
++	  opqlsa.o \
+ 	  ospf.o \
+ 	  pat.o \
+ 	  phyint.o \
+diff -X exclude_files -Nabur ospfd1.28/src/asbrlsa.C ospfd/src/asbrlsa.C
+--- ospfd1.28/src/asbrlsa.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/asbrlsa.C	Mon Apr  2 11:03:51 2001
+@@ -80,7 +80,7 @@
+ 
+     ls_id = rte->rtrid();
+     length = sizeof(LShdr) + sizeof(SummHdr);
+-    olsap = (asbrLSA *) ospf->myLSA(this, LST_ASBR, ls_id);
++    olsap = (asbrLSA *) ospf->myLSA(0, this, LST_ASBR, ls_id);
+     // Calculate cost
+     if (ls_id == ospf->my_id()) {
+ 	cost = LSInfinity;
+@@ -130,7 +130,7 @@
+     summ->mask = 0;
+     summ->metric = hton32(cost);
+ 
+-    (void) ospf->lsa_reorig(this, olsap, hdr, forced);
++    (void) ospf->lsa_reorig(0, this, olsap, hdr, forced);
+ }
+ 
+ /* Figure out whether we should be injecting an indication-LSA
+diff -X exclude_files -Nabur ospfd1.28/src/asexlsa.C ospfd/src/asexlsa.C
+--- ospfd1.28/src/asexlsa.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/asexlsa.C	Mon Apr  2 11:05:28 2001
+@@ -327,7 +327,7 @@
+ 	return;
+ 
+     // Find current LSA, if any
+-    if ((olsap = (ASextLSA *)ospf->myLSA(0, LST_ASL, ls_id))) {
++    if ((olsap = (ASextLSA *)ospf->myLSA(0, 0, LST_ASL, ls_id))) {
+ 	o_rte = olsap->orig_rte;
+ 	olsap->orig_rte = rte;
+     }
+@@ -368,7 +368,7 @@
+     ase->faddr = (faddr = exdata->fwd_rte()) ? hton32(faddr->address()) : 0;
+     ase->rtag = hton32(exdata->tag);
+ 
+-    nlsap = (ASextLSA *) ospf->lsa_reorig(0, olsap, hdr, forced);
++    nlsap = (ASextLSA *) ospf->lsa_reorig(0, 0, olsap, hdr, forced);
+     if (nlsap)
+ 	nlsap->orig_rte = rte;
+ 
+diff -X exclude_files -Nabur ospfd1.28/src/dbage.C ospfd/src/dbage.C
+--- ospfd1.28/src/dbage.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/dbage.C	Tue Apr  3 12:57:46 2001
+@@ -442,7 +442,7 @@
+ 	LSA *lsap;
+ 	if (flooding_scope(lstype) != AreaScope)
+ 	    continue;
+-	if (!(tree = ospf->FindLSdb(this, lstype)))
++	if (!(tree = ospf->FindLSdb(0, this, lstype)))
+ 	    continue;
+ 	iter = new AVLsearch(tree);
+ 	while ((lsap = (LSA *)iter->next())) {
+diff -X exclude_files -Nabur ospfd1.28/src/grplsa.C ospfd/src/grplsa.C
+--- ospfd1.28/src/grplsa.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/grplsa.C	Mon Apr  2 11:10:27 2001
+@@ -29,7 +29,7 @@
+ /* Constructor for a group-membership-LSA.
+  */
+ 
+-grpLSA::grpLSA(SpfArea *a, LShdr *hdr, int blen) : LSA(a, hdr, blen)
++grpLSA::grpLSA(SpfArea *a, LShdr *hdr, int blen) : LSA(0, a, hdr, blen)
+ 
+ {
+ }
+@@ -106,7 +106,7 @@
+     AVLitem *entry;
+     GMref *gmref;
+ 
+-    olsap = ospf->myLSA(this, LST_GM, group);
++    olsap = ospf->myLSA(0, this, LST_GM, group);
+     if (!ospf->mospf_enabled()) {
+ 	lsa_flush(olsap);
+ 	return;
+@@ -194,7 +194,7 @@
+     else {
+ 	// Fill in length, then reoriginate
+         hdr->ls_length = hton16(length);
+-	(void) ospf->lsa_reorig(this, olsap, hdr, forced);
++	(void) ospf->lsa_reorig(0, this, olsap, hdr, forced);
+     }
+ }
+ 
+@@ -239,7 +239,7 @@
+     if (is_wild_card())
+         return(true);
+     // look for group-membership-LSA
+-    glsa = (grpLSA *) ospf->FindLSA(lsa_ap, LST_GM, group, adv_rtr());
++    glsa = (grpLSA *) ospf->FindLSA(0, lsa_ap, LST_GM, group, adv_rtr());
+     if (!glsa)
+ 	return(false);
+     // Search for vertex
+diff -X exclude_files -Nabur ospfd1.28/src/hostmode.C ospfd/src/hostmode.C
+--- ospfd1.28/src/hostmode.C	Fri Mar 16 14:06:21 2001
++++ ospfd/src/hostmode.C	Mon Apr  2 11:15:20 2001
+@@ -96,7 +96,7 @@
+ 	    lsid_t lsid;
+ 	    TNode *node;
+ 	    lsid = np->id();
+-	    node = (TNode *)ospf->FindLSA(if_area, LST_RTR, lsid, lsid);
++	    node = (TNode *)ospf->FindLSA(0, if_area, LST_RTR, lsid, lsid);
+ 	    if (node)
+ 	        ospf->add_cand_node(this, node, cand);
+ 	}
+@@ -153,7 +153,7 @@
+ 	if (np->state() != NBS_FULL)
+ 	    continue;
+ 	lsid = np->id();
+-	node = (TNode *)ospf->FindLSA(if_area, LST_RTR, lsid, lsid);
++	node = (TNode *)ospf->FindLSA(0, if_area, LST_RTR, lsid, lsid);
+ 	if (node)
+ 	    ospf->add_cand_node(this, node, cand);
+     }
+diff -X exclude_files -Nabur ospfd1.28/src/lsa.C ospfd/src/lsa.C
+--- ospfd1.28/src/lsa.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/lsa.C	Tue Apr  3 13:00:33 2001
+@@ -30,7 +30,7 @@
+  * is also copied into the LSA.
+  */
+ 
+-LSA::LSA(SpfArea *ap, LShdr *lshdr, int blen)
++LSA::LSA(SpfIfc *ip, SpfArea *ap, LShdr *lshdr, int blen)
+ : AVLitem(ntoh32(lshdr->ls_id), ntoh32(lshdr->ls_org)),
+   lsa_type(lshdr->ls_type)
+ 
+@@ -39,6 +39,7 @@
+ 
+     hdr_parse(lshdr);
+     lsa_body = 0;
++    lsa_ifp = ip;
+     lsa_ap = ap;
+     lsa_agefwd = 0;
+     lsa_agerv = 0;
+@@ -60,9 +61,9 @@
+     // Fake LSAs aren't install in database
+     if (blen) {
+ 	// Add to per-type AVL tree
+-	btree = ospf->FindLSdb(ap, lsa_type);
++	btree = ospf->FindLSdb(ip, ap, lsa_type);
+ 	btree->add((AVLitem *) this);
+-	if (flooding_scope(lsa_type) == AreaScope)
++	if (flooding_scope(lsa_type) != GlobalScope)
+ 	    source = ap->add_abr(adv_rtr());
+ 	else
+ 	    source = ospf->add_asbr(adv_rtr());
+@@ -122,7 +123,7 @@
+  */
+ 
+ TNode::TNode(class SpfArea *ap, LShdr *lshdr, int blen)
+-: LSA(ap, lshdr, blen), PriQElt()
++: LSA(0, ap, lshdr, blen), PriQElt()
+ 
+ {
+     t_links = 0;
+@@ -137,7 +138,7 @@
+  * table calculation.
+  */
+ 
+-rteLSA::rteLSA(SpfArea *ap, LShdr *hdr, int blen) : LSA(ap, hdr, blen)
++rteLSA::rteLSA(SpfArea *ap, LShdr *hdr, int blen) : LSA(0, ap, hdr, blen)
+ 
+ {
+     rte = 0;
+diff -X exclude_files -Nabur ospfd1.28/src/lsa.h ospfd/src/lsa.h
+--- ospfd1.28/src/lsa.h	Fri Mar 16 14:06:20 2001
++++ ospfd/src/lsa.h	Thu Apr  5 14:14:01 2001
+@@ -42,6 +42,7 @@
+     uns16 lsa_length;	// Length of LSA, in bytes
+ 
+     byte *lsa_body;	// LSA body
++    class SpfIfc *lsa_ifp;// Interface for link-scoped LSAs
+     class SpfArea *lsa_ap; // Containing area
+     LSA	*lsa_agefwd;	// forward link in age bins
+     LSA	*lsa_agerv;	// reverse link in age bins
+@@ -74,7 +75,7 @@
+ public:
+     RTE	*source;	// Routing table entry of orig. rtr
+ 
+-    LSA(class SpfArea *, LShdr *, int blen = 0);
++    LSA(class SpfIfc *, class SpfArea *, LShdr *, int blen = 0);
+     virtual ~LSA();
+ 
+     inline byte ls_type();
+diff -X exclude_files -Nabur ospfd1.28/src/lsdb.C ospfd/src/lsdb.C
+--- ospfd1.28/src/lsdb.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/lsdb.C	Thu Apr  5 14:14:01 2001
+@@ -24,17 +24,19 @@
+ 
+ #include "ospfinc.h"
+ #include "system.h"
+-
++#include "opqlsa.h"
+ 
+ /* Find the AVL tree associated with this particular area
+  * and LS type.
+  */
+ 
+-AVLtree *OSPF::FindLSdb(SpfArea *ap, byte lstype)
++AVLtree *OSPF::FindLSdb(SpfIfc *ip, SpfArea *ap, byte lstype)
+ 
+ {
+     if (lstype == LST_ASL)	// AS-external_LSAs
+ 	return(&ospf->extLSAs);
++    if (lstype == LST_AS_OPQ)	// AS-scoped Opaque-LSAs
++	return(&ospf->ASOpqLSAs);
+ 
+     if (ap) {
+ 	switch(lstype) {
+@@ -48,11 +50,16 @@
+ 	    return(&ap->asbrLSAs);
+           case LST_GM:		// Group-membership-LSA (MOSPF)
+ 	    return(&ap->grpLSAs);
++          case LST_AREA_OPQ:	// Area-scoped Opaque-LSAs
++	    return(&ap->AreaOpqLSAs);
+           default:
+ 	    break;
+         }
+     }
+ 
++    if (ip && lstype == LST_LINK_OPQ)	// Link-scoped Opaque-LSAs
++	return(&ip->LinkOpqLSAs);
++
+     return(0);
+ }
+ 
+@@ -63,13 +70,17 @@
+ 
+ {
+     switch(lstype) {
++      case LST_LINK_OPQ:// Link-scoped Opaque-LSAs
++	return(LocalScope);
+       case LST_RTR: 	// Router-LSAs
+       case LST_NET: 	// Network-LSAs
+       case LST_SUMM:	// Summary-link LSAs (inter-area routes)
+       case LST_ASBR:	// ASBR-summaries (inter-area)
+       case LST_GM:	// Group-membership-LSA (MOSPF)
++      case LST_AREA_OPQ:// Area-scoped Opaque-LSAs
+ 	return(AreaScope);
+       case LST_ASL: 	// AS-external_LSAs
++      case LST_AS_OPQ:	// AS-scoped Opaque-LSAs
+ 	return(GlobalScope);
+       default:
+ 	break;
+@@ -103,12 +114,12 @@
+  * performing the Dijkstra.
+  */
+ 
+-LSA *OSPF::FindLSA(SpfArea *ap, byte lstype, lsid_t lsid, rtid_t rtid)
++LSA *OSPF::FindLSA(SpfIfc *ip,SpfArea *ap,byte lstype,lsid_t lsid, rtid_t rtid)
+ 
+ {
+     AVLtree *btree;
+ 
+-    if (!(btree = FindLSdb(ap, lstype)))
++    if (!(btree = FindLSdb(ip, ap, lstype)))
+ 	return(0);
+ 
+     return((LSA *) btree->find((uns32) lsid, (uns32) rtid));
+@@ -118,10 +129,10 @@
+  * ourselves have originated, if any.
+  */
+ 
+-LSA *OSPF::myLSA(SpfArea *ap, byte lstype, lsid_t lsid)
++LSA *OSPF::myLSA(SpfIfc *ip, SpfArea *ap, byte lstype, lsid_t lsid)
+ 
+ {
+-    return(FindLSA(ap, lstype, lsid, myid));
++    return(FindLSA(ip, ap, lstype, lsid, myid));
+ }
+ 
+ /* Append all the LSAs of a particular type to a given lsalist.
+@@ -129,13 +140,15 @@
+  * beginning of the Database Description process.
+  */
+ 
+-void SpfArea::AddTypesToList(byte lstype, LsaList *lp)
++void SpfIfc::AddTypesToList(byte lstype, LsaList *lp)
+ 
+ {
+     AVLtree *btree;
+     AVLitem *ptr;
++    SpfArea *ap;
+ 
+-    if (!(btree = ospf->FindLSdb(this, lstype)))
++    ap = area();
++    if (!(btree = ospf->FindLSdb(this, ap, lstype)))
+ 	return;
+ 
+     ptr = (LSA *) btree->sllhead;
+@@ -155,7 +168,7 @@
+  * reference "current" after calling this routine.
+  */
+ 
+-LSA *OSPF::AddLSA(SpfArea *ap, LSA *current, LShdr *hdr, bool changed)
++LSA *OSPF::AddLSA(SpfIfc *ip,SpfArea *ap,LSA *current,LShdr *hdr,bool changed)
+ 
+ {
+     LSA *lsap;
+@@ -207,6 +220,11 @@
+ 	  case LST_GM:
+ 	    lsap = new grpLSA(ap, hdr, blen);
+ 	    break;
++	  case LST_LINK_OPQ:
++	  case LST_AREA_OPQ:
++	  case LST_AS_OPQ:
++	    lsap = new opqLSA(ip, ap, hdr, blen);
++	    break;
+ 	  default:
+ 	    lsap = 0;
+ 	    sys->halt(HALT_LSTYPE, "Bad LS type");
+@@ -231,6 +249,9 @@
+     // Parse the new body contents
+     ParseLSA(lsap, hdr);
+     update_lsdb_xsum(lsap, true);
++    // Provide Opaque-LSAs to requesters
++    if (hdr->ls_type >= LST_LINK_OPQ && hdr->ls_type <= LST_AS_OPQ)
++        upload_opq(lsap);
+     // If changes, schedule new routing calculations
+     if (changed)
+ 	rtsched(lsap, old_rte);
+@@ -288,7 +309,7 @@
+ 	LSA *lsap;
+ 	if (flooding_scope(lstype) != AreaScope)
+ 	    continue;
+-	if (!(tree = ospf->FindLSdb(this, lstype)))
++	if (!(tree = ospf->FindLSdb(0, this, lstype)))
+ 	    continue;
+ 	iter = new AVLsearch(tree);
+ 	while ((lsap = (LSA *)iter->next()))
+@@ -411,22 +432,28 @@
+     update_lsdb_xsum(lsap, false);
+     lsap->stop_aging();
+     UnParseLSA(lsap);
+-    btree = FindLSdb(lsap->lsa_ap, lsap->lsa_type);
++    btree = FindLSdb(lsap->lsa_ifp, lsap->lsa_ap, lsap->lsa_type);
+     btree->remove((AVLitem *) lsap);
+     lsap->chkref();
+ }
+ 
+ /* Update the checksum of the whole database. One checksum
+- * is kept for AS-external-LSAs, and one for each area's
+- * link-state database.
++ * is kept for AS-external-LSAs, one for each area's
++ * link-state database, and one for each interface (link-scoped
++ * LSAs).
+  */
+ 
+ void OSPF::update_lsdb_xsum(LSA *lsap, bool add)
+ 
+ {
+     uns32 *db_xsum;
++    int scope;
+ 
+-    if (flooding_scope(lsap->ls_type()) == AreaScope)
++    scope = flooding_scope(lsap->ls_type());
++
++    if (scope == LocalScope)
++	db_xsum = &lsap->lsa_ifp->db_xsum;
++    else if (scope == AreaScope)
+ 	db_xsum = &lsap->lsa_ap->db_xsum;
+     else
+ 	db_xsum = &ase_xsum;
+@@ -441,6 +468,9 @@
+  * first by OSPF area (AS-external-LSAs are considered part
+  * of Area 0), then LS type, Link State ID, and Advertising
+  * Router.
++ *
++ * Currently the next LSA function ignores link-scoped LSAs.
++ * You can get these by using the API routine OSPF::get_next_opq().
+  */
+ 
+ LSA *OSPF::NextLSA(aid_t a_id, byte ls_type, lsid_t id, rtid_t advrtr)
+@@ -456,9 +486,11 @@
+     do {
+ 	// Iterate over LS types
+ 	for (; ls_type <= MAX_LST; id = advrtr = 0, ++ls_type) {
+-	    if (a_id != 0 && ls_type == LST_ASL)
++	    if (flooding_scope(ls_type) == LocalScope)
++	        continue;
++	    if (a_id != 0 && flooding_scope(ls_type) == GlobalScope)
+ 	        continue;
+-	    tree = FindLSdb(ap, ls_type);
++	    tree = FindLSdb(0, ap, ls_type);
+ 	    if (tree) {
+ 	        AVLsearch iter(tree);
+ 		iter.seek(id, advrtr);
+diff -X exclude_files -Nabur ospfd1.28/src/lshdr.h ospfd/src/lshdr.h
+--- ospfd1.28/src/lshdr.h	Fri Mar 16 14:06:20 2001
++++ ospfd/src/lshdr.h	Fri Mar 30 15:56:32 2001
+@@ -61,7 +61,10 @@
+     LST_GM = 6,		// Group-membership-LSA (MOSPF)
+     LST_NSSA = 7,	// NSSA externals
+     LST_EXATTR = 8,	// External-attributes LSA
+-    MAX_LST = 8,	// Maximum number of support LSA types
++    LST_LINK_OPQ = 9,	// Link-scoped Opaque-LSA
++    LST_AREA_OPQ = 10,	// Area-scoped Opaque-LSA
++    LST_AS_OPQ = 11,	// AS-scoped Opaque-LSA
++    MAX_LST = 11,	// Maximum number of supported LSA types
+ };
+ 
+ inline bool LShdr::do_not_age()
+diff -X exclude_files -Nabur ospfd1.28/src/monitor.C ospfd/src/monitor.C
+--- ospfd1.28/src/monitor.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/monitor.C	Tue Apr  3 15:59:24 2001
+@@ -402,8 +402,8 @@
+ 
+     if (req->hdr.exact != 0) {
+ 	SpfArea *ap;
+-	if ((ap = FindArea(a_id)) || ls_type == LST_ASL)
+-	    lsap = FindLSA(ap, ls_type, id, advrtr);
++	if ((ap = FindArea(a_id)) || flooding_scope(ls_type) == GlobalScope)
++	    lsap = FindLSA(0, ap, ls_type, id, advrtr);
+     } else
+         lsap = NextLSA(a_id, ls_type, id, advrtr);
+ 
+@@ -497,6 +497,44 @@
+     }
+ 
+     sys->monitor_response(msg, Rte_Response, mlen, conn_id);
++}
++
++/* Respond to a query to get the next Opaque-LSA.
++ */
++
++void OSPF::opq_stats(class MonMsg *req, int conn_id)
++
++{
++    aid_t a_id;
++    int phyint;
++    InAddr if_addr;
++    LShdr *hdr;
++    int mlen;
++    MonMsg *msg;
++    bool success;
++
++    success = get_next_opq(conn_id, phyint, if_addr, a_id, hdr);
++
++    mlen = sizeof(MonHdr) + sizeof(OpqRsp);
++    if (success)
++        mlen += ntoh16(hdr->ls_length);
++    msg = get_monbuf(mlen);
++    msg->hdr.version = OSPF_MON_VERSION;
++    msg->hdr.retcode = 1;
++    msg->hdr.exact = 1;
++    msg->hdr.id = req->hdr.id;
++
++    if (success) {
++        OpqRsp *opqrsp;
++	msg->hdr.retcode = 0;
++	opqrsp = &msg->body.opqrsp;
++	opqrsp->phyint = hton32(phyint);
++	opqrsp->if_addr = hton32(if_addr);
++	opqrsp->a_id = hton32(a_id);
++	memcpy((opqrsp + 1), hdr, ntoh16(hdr->ls_length));
++    }
++
++    sys->monitor_response(msg, OpqLSA_Response, mlen, conn_id);
+ }
+ 
+ /* Utility routines used to "get" and "get-next".
+diff -X exclude_files -Nabur ospfd1.28/src/monitor.h ospfd/src/monitor.h
+--- ospfd1.28/src/monitor.h	Fri Mar 16 14:06:20 2001
++++ ospfd/src/monitor.h	Fri Mar 30 16:24:43 2001
+@@ -173,6 +173,17 @@
+     } hops[MAXPATH];
+ };
+ 
++/* Response to request for next Opaque-LSA.
++ * Fixed length structure followed by Opaque-LSA in
++ * its entireity.
++ */
++
++struct OpqRsp {
++    int32 phyint;
++    InAddr if_addr;
++    aid_t a_id;
++};
++
+ /* Overall format of monitoring requests and responses.
+  */
+ 
+@@ -198,6 +209,7 @@
+ 	IfcRsp ifcrsp;
+ 	NbrRsp nbrsp;
+ 	RteRsp rtersp;
++        OpqRsp opqrsp;
+     } body;
+ };
+ 
+@@ -214,6 +226,8 @@
+     MonReq_VLNbr,	// Virtual neighbor statistics
+     MonReq_LSA,		// Dump LSA contents
+     MonReq_Rte,		// Dump routing table entry
++    MonReq_OpqReg,	// Register for Opaque-LSAs
++    MonReq_OpqNext,	// Get next Opaque-LSA
+ 
+     Stat_Response = 100, // Global statistics response
+     Area_Response,	// Area response
+@@ -221,6 +235,7 @@
+     Nbr_Response,	// Neighbor response
+     LSA_Response,	// LSA
+     Rte_Response,	// Routing table entry
++    OpqLSA_Response,	// Opaque-LSA response
+ 
+     OSPF_MON_VERSION = 1, // Version of monitoring messages
+ };
+diff -X exclude_files -Nabur ospfd1.28/src/mospf.C ospfd/src/mospf.C
+--- ospfd1.28/src/mospf.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/mospf.C	Mon Apr  2 14:27:03 2001
+@@ -325,7 +325,7 @@
+     // Initialize Dijkstra state
+     mospf_in_count = 0;
+     cost = Infinity;
+-    mylsa = (rtrLSA *) ospf->myLSA(this, LST_RTR, ospf->myid);
++    mylsa = (rtrLSA *) ospf->myLSA(0, this, LST_RTR, ospf->myid);
+     if (mylsa == 0 || !mylsa->parsed || ifmap == 0)
+ 	return;
+     rtr = (rtrLSA *) rtrLSAs.sllhead;
+@@ -364,7 +364,7 @@
+     TNode *V;
+     TNode *nh=0;
+ 
+-    mylsa = (rtrLSA *) ospf->myLSA(this, LST_RTR, ospf->my_id());
++    mylsa = (rtrLSA *) ospf->myLSA(0, this, LST_RTR, ospf->my_id());
+ 
+     while ((V = (TNode *) cand.priq_rmhead())) {
+ 	int i, j;
+@@ -435,7 +435,7 @@
+ 	SpfData *rd;
+ 	mcase = SourceIntraArea;
+ 	rd = rte->r_ospf;
+-	W = (TNode *) ospf->FindLSA(this, rd->lstype, rd->lsid, rd->rtid);
++	W = (TNode *) ospf->FindLSA(0, this, rd->lstype, rd->lsid, rd->rtid);
+ 	if (W == 0)
+ 	    return(mcase);
+ 	if (W->ls_id() == ospf->my_id()) {
+@@ -573,7 +573,7 @@
+ 	    TNode *W;
+ 	    lsid_t id;
+ 	    id = summ->adv_rtr();
+-	    if ((W = (TNode *) ospf->FindLSA(this, LST_RTR, id, id)))
++	    if ((W = (TNode *) ospf->FindLSA(0, this, LST_RTR, id, id)))
+ 	        mospf_possibly_add(cand,W, summ->adv_cost+add_cost,
+ 				   0,ILSummary, 0);
+ 	}
+@@ -649,7 +649,7 @@
+ 	    mospf_in_count = 1;
+ 	    mospf_in_phys[0] = rte->exdata->phyint;
+ 	}
+-	if ((W = (TNode *) ospf->FindLSA(this, LST_RTR, id, id)))
++	if ((W = (TNode *) ospf->FindLSA(0, this, LST_RTR, id, id)))
+ 	    mospf_possibly_add(cand,W,cost,0,ILExternal, 0);
+ 	for (summ = asbr->summs; summ; summ = (asbrLSA *)summ->link) {
+ 	    if (summ->area() != this)
+@@ -659,7 +659,7 @@
+ 	    if ((summ->source && summ->source->type() == RT_SPF) ||
+ 		(summ->adv_rtr() == ospf->my_id())) {
+ 	        id = summ->adv_rtr();
+-		if ((W = (TNode *) ospf->FindLSA(this, LST_RTR, id, id)))
++		if ((W = (TNode *) ospf->FindLSA(0, this, LST_RTR, id, id)))
+ 		    mospf_possibly_add(cand, W, cost+summ->adv_cost,
+ 				       0, ILSummary, 0);
+ 	    }
+diff -X exclude_files -Nabur ospfd1.28/src/nbrfsm.C ospfd/src/nbrfsm.C
+--- ospfd1.28/src/nbrfsm.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/nbrfsm.C	Tue Apr  3 16:03:46 2001
+@@ -325,19 +325,27 @@
+ void SpfNbr::nba_snapshot()
+ 
+ {
+-    SpfArea *ap;
+ 
+-    ap = n_ifp->area();
++    // Area-scoped LSAs
++    n_ifp->AddTypesToList(LST_RTR, &n_ddlst);
++    n_ifp->AddTypesToList(LST_NET, &n_ddlst);
++    n_ifp->AddTypesToList(LST_SUMM, &n_ddlst);
++    n_ifp->AddTypesToList(LST_ASBR, &n_ddlst);
++    if (supports(SPO_OPQ))
++        n_ifp->AddTypesToList(LST_AREA_OPQ, &n_ddlst);
++    if ((n_opts & SPO_MC) != 0)
++	n_ifp->AddTypesToList(LST_GM, &n_ddlst);
+     
+-    ap->AddTypesToList(LST_RTR, &n_ddlst);
+-    ap->AddTypesToList(LST_NET, &n_ddlst);
+-    ap->AddTypesToList(LST_SUMM, &n_ddlst);
+-    ap->AddTypesToList(LST_ASBR, &n_ddlst);
++    // AS-scoped
++    if ((!n_ifp->is_virtual()) && (!n_ifp->area()->is_stub())) {
++	n_ifp->AddTypesToList(LST_ASL, &n_ddlst);
++	if (supports(SPO_OPQ))
++	    n_ifp->AddTypesToList(LST_AS_OPQ, &n_ddlst);
++    }
+ 
+-    if ((!n_ifp->is_virtual()) && (!ap->is_stub()))
+-	ap->AddTypesToList(LST_ASL, &n_ddlst);
+-    if ((n_opts & SPO_MC) != 0)
+-	ap->AddTypesToList(LST_GM, &n_ddlst);
++    // Link-scoped
++    if (supports(SPO_OPQ))
++        n_ifp->AddTypesToList(LST_LINK_OPQ, &n_ddlst);
+ }
+ 
+ 
+diff -X exclude_files -Nabur ospfd1.28/src/netlsa.C ospfd/src/netlsa.C
+--- ospfd1.28/src/netlsa.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/netlsa.C	Mon Apr  2 14:29:31 2001
+@@ -37,7 +37,7 @@
+ {
+     LSA *olsap;
+ 
+-    olsap = ospf->myLSA(if_area, LST_NET, if_addr);
++    olsap = ospf->myLSA(0, if_area, LST_NET, if_addr);
+ 
+     if (if_state != IFS_DR)
+ 	lsa_flush(olsap);
+@@ -79,7 +79,7 @@
+ 	    if (np->state() == NBS_FULL)
+ 		*(++nbr_ids) = hton32(np->id());
+ 	}
+-	(void) ospf->lsa_reorig(if_area, olsap, hdr, forced);
++	(void) ospf->lsa_reorig(0, if_area, olsap, hdr, forced);
+     }
+ }
+ 
+@@ -209,7 +209,7 @@
+     AVLtree *tree;
+ 
+     // Reparse any other network-LSA with same Link State ID
+-    tree = ospf->FindLSdb(lsa_ap, LST_NET);
++    tree = ospf->FindLSdb(0, lsa_ap, LST_NET);
+     olsap = (netLSA *) tree->previous(ls_id()+1, 0);
+     while (olsap) {
+ 	LShdr *hdr;
+diff -X exclude_files -Nabur ospfd1.28/src/opqlsa.C ospfd/src/opqlsa.C
+--- ospfd1.28/src/opqlsa.C	Wed Dec 31 19:00:00 1969
++++ ospfd/src/opqlsa.C	Thu Apr  5 14:56:22 2001
+@@ -0,0 +1,296 @@
++/*
++ *   OSPFD routing daemon
++ *   Copyright (C) 2000 by John T. Moy
++ *   
++ *   This program is free software; you can redistribute it and/or
++ *   modify it under the terms of the GNU General Public License
++ *   as published by the Free Software Foundation; either version 2
++ *   of the License, or (at your option) any later version.
++ *   
++ *   This program is distributed in the hope that it will be useful,
++ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *   GNU General Public License for more details.
++ *   
++ *   You should have received a copy of the GNU General Public License
++ *   along with this program; if not, write to the Free Software
++ *   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++ */
++
++/* Internal support for Opaque-LSAs.
++ */
++
++#include "ospfinc.h"
++#include "phyint.h"
++#include "ifcfsm.h"
++#include "opqlsa.h"
++
++/* Constructor for a opaque-LSA.
++ */
++
++opqLSA::opqLSA(SpfIfc *i, SpfArea *a, LShdr *hdr, int blen)
++  : LSA(i, a, hdr, blen)
++
++{
++    adv_opq = false;
++    local_body = 0;
++    local_blen = 0;
++}
++
++/* Parse a opaque-LSA. Just set the exception
++ * flag, so that the caller will instead store
++ * the body of the LSA.
++ */
++
++void opqLSA::parse(LShdr *)
++
++{
++    exception = true;
++    // Store for Opaque-LSA application upload, in case
++    // LSA is deleted before it can be uploaded
++    phyint = lsa_ifp->if_phyint;
++    if_addr = lsa_ifp->if_addr;
++    a_id = lsa_ap->id();
++}
++
++/* Unparse an opaque-LSA. NULL function.
++ */
++
++void opqLSA::unparse()
++
++{
++}
++
++/* Build an opaque-LSA. Since the parse function
++ * always sets the exception flag, this function is never really
++ * called.
++ */
++
++void opqLSA::build(LShdr *)
++
++{
++}
++
++/* Reoriginate an opaque-LSA.
++ */
++
++void opqLSA::reoriginate(int forced)
++
++{
++    ospf->opq_orig(lsa_ifp, lsa_ap, ls_type(), ls_id(), local_body,
++		   local_blen, adv_opq, forced);
++}
++
++/* Originate or reoriginate an Opaque-LSA.
++ * Find the current database copy, if any. Then store
++ * a local copy of the body and install/flood
++ * the LSA, after building the network copy, by calling
++ * OSPF::lsa_reorig().
++ */
++
++void OSPF::opq_orig(SpfIfc *ip, SpfArea *ap, byte lstype, lsid_t ls_id, 
++		    byte *body, int blen, bool adv, int forced)
++
++{
++    opqLSA *lsap;
++    int maxlen;
++    LShdr *hdr;
++    seq_t seqno;
++
++    lsap = (opqLSA *) myLSA(ip, ap, lstype, ls_id);
++    if (!adv) {
++        if (lsap) {
++	    lsap->adv_opq = false;
++	    delete [] lsap->local_body;
++	    lsap->local_body = 0;
++	    lsap->local_blen = 0;
++	    lsa_flush(lsap);
++	}
++	return;
++    }
++    
++    // Estimate size of LSA
++    maxlen = sizeof(LShdr) + blen;
++    // Get LS Sequence Number
++    seqno = ospf_get_seqno(lsap, maxlen, forced);
++    if (seqno != InvalidLSSeq) {
++	LSA *nlsap;
++	// Fill in LSA header
++        hdr = ospf->orig_buffer();
++	hdr->ls_opts = SPO_DC;
++	if (ap && !ap->a_stub)
++	    hdr->ls_opts |= SPO_EXT;
++	hdr->ls_type = lstype;
++	hdr->ls_id = hton32(ls_id);
++	hdr->ls_org = hton32(my_id());
++	hdr->ls_seqno = hton32(seqno);
++	// Body
++	memcpy(hdr + 1, body, blen);
++	// Fill in length, then reoriginate
++        hdr->ls_length = hton16(maxlen);
++	if ((nlsap = ospf->lsa_reorig(ip, ap, lsap, hdr, forced)))
++	    lsap = (opqLSA *) nlsap;
++    }
++
++    // Store local copy of body, in case it is overwritten
++    // by received self-originated LSAs
++    if (lsap) {
++        lsap->adv_opq = true;
++	if (lsap->local_body != body) {
++	    delete [] lsap->local_body;
++	    lsap->local_body = new byte[blen];
++	    memcpy(lsap->local_body, body, blen);
++	    lsap->local_blen = blen;
++	}
++    }
++}
++
++/* API routines used to force origination of Opaque-LSAs
++ * into the routing domain. One function each for
++ * link-local, area-scoped, and AS-scoped LSAs.
++ */
++
++bool OSPF::adv_link_opq(int phyint, InAddr ifaddr, lsid_t lsid,
++			byte *body, int blen, bool adv)
++
++{
++    SpfIfc *ip;
++
++    if (!(ip = find_ifc(ifaddr, phyint)))
++        return(false);
++
++    opq_orig(ip, 0, LST_LINK_OPQ, lsid, body, blen, adv, 0);
++    return(true);
++}
++
++bool OSPF::adv_area_opq(aid_t a_id, lsid_t lsid, byte *body, int blen,bool adv)
++
++{
++    SpfArea *ap;
++
++    if (!(ap = FindArea(a_id)))
++        return(false);
++
++    opq_orig(0, ap, LST_AREA_OPQ, lsid, body, blen, adv, 0);
++    return(true);
++}
++
++void OSPF::adv_as_opq(lsid_t lsid, byte *body, int blen, bool adv)
++
++{
++    opq_orig(0, 0, LST_AS_OPQ, lsid, body, blen, adv, 0);
++}
++
++/* Constructor for a holding queue of Opaque-LSAs, destined
++ * for a requesting application.
++ */
++
++OpqHoldQ::OpqHoldQ(int conn_id) : AVLitem(conn_id, 0)
++
++{
++}
++
++/* OSPF API routine whereby an application can register to
++ * receive Opaque-LSAs. It gets all of them, and must filter
++ * out the ones it doesn't want.
++ */
++
++void OSPF::register_for_opqs(int conn_id, bool disconnect)
++
++{
++    OpqHoldQ *holdq;
++    IfcIterator iiter(this);
++    SpfIfc *ip;
++    AreaIterator aiter(this);
++    SpfArea *ap;
++
++    holdq = (OpqHoldQ *) opq_uploads.find(conn_id, 0);
++    if (disconnect) {
++        if (holdq) {
++	    holdq->holdq.clear();
++	    opq_uploads.remove(holdq);
++	    delete holdq;
++	}
++        return;
++    }
++    // Already registered? If so, just ignore new registration
++    else if (holdq)
++        return;
++    // Create new holdq
++    holdq = new OpqHoldQ(conn_id);
++    opq_uploads.add(holdq);
++    // Install all current Opaque-LSAs onto holdq
++    // Global scoped
++    if (ifcs)
++        ifcs->AddTypesToList(LST_AS_OPQ, &holdq->holdq);
++    // Area scoped
++    while ((ap = aiter.get_next())) {
++        if (ap->a_ifcs)
++	    ap->a_ifcs->AddTypesToList(LST_AREA_OPQ, &holdq->holdq);
++    }
++    // Link scoped
++    while ((ip = iiter.get_next()))
++        ip->AddTypesToList(LST_LINK_OPQ, &holdq->holdq);
++}
++
++/* Return the next Opaque-LSA on the hold queue to the equesting
++ * application.
++ */
++
++bool OSPF::get_next_opq(int conn_id, int &phyint, InAddr &if_addr,
++			aid_t &a_id, struct LShdr * &hdr)
++
++{
++    OpqHoldQ *holdq;
++    opqLSA *lsap;
++
++    // Not registered?
++    if (!(holdq = (OpqHoldQ *) opq_uploads.find(conn_id, 0)))
++        return(false);
++    LsaListIterator iter(&holdq->holdq);
++    while ((lsap = (opqLSA *)iter.get_next())) {
++        // OK for Opaque-LSAs. But other LSAs should
++        // not be built if they are not valid!
++        hdr = BuildLSA(lsap);
++        if (!lsap->valid() && lsap->lsa_rcvage != MaxAge) {
++	    iter.remove_current();
++	    continue;
++	}
++	phyint = lsap->phyint;
++	if_addr = lsap->if_addr;
++	a_id = lsap->a_id;
++	iter.remove_current();
++	return(true);
++    }
++    return(false);
++}
++
++/* Add new Opaque-LSA to upload lists for all requesting
++ * applications.
++ */
++
++void OSPF::upload_opq(LSA *lsap)
++
++{
++    AVLsearch iter(&opq_uploads);
++    OpqHoldQ *holdq;
++
++    while ((holdq = (OpqHoldQ *)iter.next()))
++        holdq->holdq.addEntry(lsap);
++}
++
++/* When overwriting the database copy, copy the needed state
++ * into the nely installed LSA. For Opaque-LSAs, need
++ * to copy any local data that is used in originating
++ * the Opaque-LSA.
++ */
++
++void opqLSA::update_in_place(LSA *arg)
++
++{
++    opqLSA *olsap;
++    olsap = (opqLSA *) arg;
++    adv_opq = olsap->adv_opq;
++    local_body = olsap->local_body;
++    local_blen = olsap->local_blen;
++}
+diff -X exclude_files -Nabur ospfd1.28/src/opqlsa.h ospfd/src/opqlsa.h
+--- ospfd1.28/src/opqlsa.h	Wed Dec 31 19:00:00 1969
++++ ospfd/src/opqlsa.h	Thu Apr  5 14:28:18 2001
+@@ -0,0 +1,57 @@
++/*
++ *   OSPFD routing daemon
++ *   Copyright (C) 2000 by John T. Moy
++ *   
++ *   This program is free software; you can redistribute it and/or
++ *   modify it under the terms of the GNU General Public License
++ *   as published by the Free Software Foundation; either version 2
++ *   of the License, or (at your option) any later version.
++ *   
++ *   This program is distributed in the hope that it will be useful,
++ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *   GNU General Public License for more details.
++ *   
++ *   You should have received a copy of the GNU General Public License
++ *   along with this program; if not, write to the Free Software
++ *   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++ */
++
++/* Internal support for Opaque-LSAs.
++ */
++
++/* We don't look at the body of Opaque-LSAs.
++ * Howver, if we are requested to originate an
++ * Opaque-LSA, we store the body separately so
++ * that it can be refreshed from local storage.
++ */
++
++class opqLSA : public LSA {
++    bool adv_opq;
++    byte *local_body;
++    int local_blen;
++    // Stored for opaque-LSA upload, in case
++    // LSA is deleted before it can be uploaded
++    int phyint;
++    InAddr if_addr;
++    aid_t a_id;
++public:
++    opqLSA(class SpfIfc *, class SpfArea *, LShdr *, int blen);
++    virtual void reoriginate(int forced);
++    virtual void parse(LShdr *hdr);
++    virtual void unparse();
++    virtual void build(LShdr *hdr);
++    virtual void update_in_place(LSA *);
++    friend class OSPF;
++};
++
++/* Holding queue for Opaque-LSAs that are to be delivered
++ * to an application.
++ */
++
++class OpqHoldQ : public AVLitem {
++    LsaList holdq;
++ public:
++    OpqHoldQ(int conn_id);
++    friend class OSPF;
++};
+diff -X exclude_files -Nabur ospfd1.28/src/ospf.C ospfd/src/ospf.C
+--- ospfd1.28/src/ospf.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/ospf.C	Tue Apr  3 16:06:59 2001
+@@ -492,6 +492,12 @@
+       case MonReq_Rte:	// Dump routing table entry
+ 	rte_stats(msg, conn_id);
+ 	break;
++      case MonReq_OpqReg:
++	register_for_opqs(conn_id);
++	break;
++      case MonReq_OpqNext:
++	opq_stats(msg, conn_id);
++	break;
+       default:
+ 	break;
+     }
+@@ -757,6 +763,8 @@
+ {
+     AreaIterator aiter(this);
+     SpfArea *a;
++    IfcIterator iiter(this);
++    SpfIfc *ip;
+ 
+     if (shutdown_phase)
+ 	return;
+@@ -765,13 +773,17 @@
+     // Set timer
+     countdown = seconds;
+     // Flush self-originated LSAs
+-    flush_self_orig(FindLSdb(0, LST_ASL));
++    flush_self_orig(FindLSdb(0, 0, LST_ASL));
++    flush_self_orig(FindLSdb(0, 0, LST_AS_OPQ));
+     while ((a = aiter.get_next())) {
+-	flush_self_orig(FindLSdb(a, LST_RTR));
+-	flush_self_orig(FindLSdb(a, LST_SUMM));
+-	flush_self_orig(FindLSdb(a, LST_ASBR));
+-	flush_self_orig(FindLSdb(a, LST_GM));
++	flush_self_orig(FindLSdb(0, a, LST_RTR));
++	flush_self_orig(FindLSdb(0, a, LST_SUMM));
++	flush_self_orig(FindLSdb(0, a, LST_ASBR));
++	flush_self_orig(FindLSdb(0, a, LST_GM));
++	flush_self_orig(FindLSdb(0, a, LST_AREA_OPQ));
+     }
++    while ((ip = iiter.get_next()))
++	flush_self_orig(FindLSdb(ip, 0, LST_LINK_OPQ));
+ }
+ 
+ /* Continue the shutdown process.
+@@ -793,7 +805,7 @@
+ 	countdown = 1;
+ 	// Flush network-LSAs
+ 	while ((a = aiter.get_next()))
+-	    flush_self_orig(FindLSdb(a, LST_NET));
++	    flush_self_orig(FindLSdb(0, a, LST_NET));
+ 	break;
+       case 2:
+ 	// Send empty Hellos
+diff -X exclude_files -Nabur ospfd1.28/src/ospf.h ospfd/src/ospf.h
+--- ospfd1.28/src/ospf.h	Fri Mar 16 14:06:20 2001
++++ ospfd/src/ospf.h	Tue Apr  3 16:14:01 2001
+@@ -66,6 +66,7 @@
+     int	inter_AS_mc:1;	// Are we an inter-AS multicast forwarder?
+     int n_extImports;	// # Imported AS externals
+     AVLtree extLSAs;	// AS-external-LSAs
++    AVLtree ASOpqLSAs;	// AS-scoped Opaque-LSAs
+     uns32 ase_xsum;	// checksum of AS-external-LSAs
+     AVLtree ASBRtree;	// AVL tree of ASBRs
+     ASBRrte *ASBRs; 	// Singly-linked ASBR routing table entries
+@@ -131,6 +132,7 @@
+     int base_priority;
+     bool disabled_msgno[MAXLOG+1];
+     bool enabled_msgno[MAXLOG+1];
++    AVLtree opq_uploads; // Opaque-LSA requesting connections
+ 
+     // Monitoring routines
+     class MonMsg *get_monbuf(int size);
+@@ -142,6 +144,7 @@
+     void vlnbr_stats(class MonMsg *, int conn_id);
+     void lsa_stats(class MonMsg *, int conn_id);
+     void rte_stats(class MonMsg *, int conn_id);
++    void opq_stats(class MonMsg *, int con_id);
+ 
+     // Utility routines
+     void clear_config();
+@@ -170,10 +173,10 @@
+     inline InAddr my_addr();
+ 
+     // Database routines
+-    AVLtree *FindLSdb(SpfArea *ap, byte lstype);
+-    LSA	*FindLSA(SpfArea *, byte lstype, lsid_t lsid, rtid_t rtid);
+-    LSA	*myLSA(SpfArea *, byte lstype, lsid_t lsid);
+-    LSA	*AddLSA(SpfArea *, LSA *current, LShdr *hdr, bool changed);
++    AVLtree *FindLSdb(SpfIfc *, SpfArea *ap, byte lstype);
++    LSA	*FindLSA(SpfIfc *, SpfArea *, byte lstype, lsid_t lsid, rtid_t rtid);
++    LSA	*myLSA(SpfIfc *, SpfArea *, byte lstype, lsid_t lsid);
++    LSA	*AddLSA(SpfIfc *,SpfArea *, LSA *current, LShdr *hdr, bool changed);
+     void DeleteLSA(LSA *lsap);
+     LSA *NextLSA(aid_t, byte, lsid_t, rtid_t);
+     void update_lsdb_xsum(LSA *, bool add);
+@@ -190,6 +193,7 @@
+     void flush_donotage();
+     void shutdown_continue();
+     void rl_orig();
++    void upload_opq(LSA *);
+ 
+     // Database aging
+     void dbage();
+@@ -207,7 +211,7 @@
+     int	self_originated(SpfNbr *, LShdr *hdr, LSA *database_copy);
+     int	get_lsid(INrte *rte, byte lstype, SpfArea *ap, lsid_t &id);
+     seq_t ospf_get_seqno(LSA *lsap, int ls_len, int forced);
+-    LSA	*lsa_reorig(SpfArea *ap, LSA *olsap, LShdr *hdr, int forced);
++    LSA	*lsa_reorig(SpfIfc *,SpfArea *ap, LSA *olsap, LShdr *hdr, int forced);
+     void age_prematurely(LSA *);
+     void sl_orig(INrte *rte, bool transit_changes_only=false);
+     void asbr_orig(ASBRrte *rte);
+@@ -220,6 +224,7 @@
+     void add_to_update(LShdr *hdr, bool demand);
+     void redo_aggregate(INrte *rangerte, SpfArea *ap);
+     void EnterOverflowState();
++    void opq_orig(SpfIfc *, SpfArea *, byte, lsid_t, byte *, int, bool, int);
+ 
+     // Routing calculations
+     ASBRrte *add_asbr(uns32 rtid);
+@@ -264,8 +269,8 @@
+   public:
+     // Version numbers
+     enum {
+-	vmajor = 1,	// Major version number
+-	vminor = 28,	// Minor version number
++	vmajor = 2,	// Major version number
++	vminor = 0,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+@@ -290,6 +295,12 @@
+     inline rtid_t my_id();
+     inline int n_extLSAs();
+     inline uns32 xsum_extLSAs();
++    // Opaque-LSA API
++    bool adv_link_opq(int phyint, InAddr, lsid_t, byte *, int len, bool);
++    bool adv_area_opq(aid_t, lsid_t, byte *, int len, bool);
++    void adv_as_opq(lsid_t, byte *, int len, bool);
++    void register_for_opqs(int conn_id, bool disconnect=false);
++    bool get_next_opq(int, int &, InAddr &, aid_t &, struct LShdr * &);
+     
+     // Configuration routines
+     void cfgOspf(struct CfgGen *msg);
+@@ -338,6 +349,7 @@
+     friend class FWDtbl;
+     friend class MPath;
+     friend class ExRtData;
++    friend class opqLSA;
+     friend void lsa_flush(class LSA *);
+     friend void ExRtData::clear_config();
+     friend SpfNbr *GetNextAdj();
+diff -X exclude_files -Nabur ospfd1.28/src/rtrlsa.C ospfd/src/rtrlsa.C
+--- ospfd1.28/src/rtrlsa.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/rtrlsa.C	Mon Apr  2 14:30:50 2001
+@@ -228,7 +228,7 @@
+     RtrLink *rlp;
+ 
+     // Current LSA in database
+-    olsap = ospf->myLSA(this, LST_RTR, ospf->my_id());
++    olsap = ospf->myLSA(0, this, LST_RTR, ospf->my_id());
+ 
+     // Calculate maximum size for LSA
+     maxlen = sizeof(LShdr) + sizeof(RTRhdr);
+@@ -338,7 +338,7 @@
+     length = ((byte *) rlp) - ((byte *) hdr);
+     hdr->ls_length = hton16(length);
+     rtrhdr->nlinks = hton16(rtrhdr->nlinks);
+-    (void) ospf->lsa_reorig(this, olsap, hdr, forced);
++    (void) ospf->lsa_reorig(0, this, olsap, hdr, forced);
+ }
+ 
+ /* Add an area's configured hosts to a router-LSA.
+diff -X exclude_files -Nabur ospfd1.28/src/spfack.C ospfd/src/spfack.C
+--- ospfd1.28/src/spfack.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spfack.C	Mon Apr  2 14:51:44 2001
+@@ -65,7 +65,7 @@
+ 	lsid = ntoh32(hdr->ls_id);
+ 	orig = ntoh32(hdr->ls_org);
+ 	// Compare received to rxmt list instance
+-	lsap = ospf->FindLSA(ap, lstype, lsid, orig);
++	lsap = ospf->FindLSA(ip, ap, lstype, lsid, orig);
+ 	compare = lsap ? lsap->cmp_instance(hdr) : 1;
+ 	// If received ack is more recent
+ 	if (compare > 0) {
+diff -X exclude_files -Nabur ospfd1.28/src/spfarea.h ospfd/src/spfarea.h
+--- ospfd1.28/src/spfarea.h	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spfarea.h	Mon Apr  2 10:52:40 2001
+@@ -39,6 +39,7 @@
+     AVLtree summLSAs;	// summary-LSAs
+     AVLtree asbrLSAs;	// asbr-summary-LSAs
+     AVLtree grpLSAs;	// group-membership-LSAs
++    AVLtree AreaOpqLSAs;// Area-scoped Opaque-LSAs
+     uns32 db_xsum;	// Database checksum
+     uns32 wo_donotage;	// #LSAs claiming no DoNotAge support
+     uns32 dna_indications;// #LSAs claiming no DoNotAge support
+@@ -101,7 +102,6 @@
+     void reinitialize();
+     void generate_summaries();
+     int n_LSAs();
+-    void AddTypesToList(byte lstype, LsaList *lp);
+     void RemoveIfc(class SpfIfc *);
+     void IfcChange(int increment);
+     void add_to_update(LShdr *hdr, bool demand);
+diff -X exclude_files -Nabur ospfd1.28/src/spfcalc.C ospfd/src/spfcalc.C
+--- ospfd1.28/src/spfcalc.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spfcalc.C	Mon Apr  2 17:16:39 2001
+@@ -135,7 +135,7 @@
+     // Put all our own router-LSAs onto candidate list
+     while ((ap = iter.get_next())) {
+ 	rtrLSA *root;
+-	root = (rtrLSA *) myLSA(ap, LST_RTR, myid);
++	root = (rtrLSA *) myLSA(0, ap, LST_RTR, myid);
+ 	if (root == 0 || !root->parsed || ap->ifmap == 0)
+ 	    continue;
+ 	root->cost0 = 0;
+@@ -406,7 +406,7 @@
+ 	return(0);
+     if (!(a = ospf->FindArea(area())))
+ 	return(0);
+-    return (ospf->FindLSA(a, r_ospf->lstype, r_ospf->lsid, r_ospf->rtid));
++    return (ospf->FindLSA(0, a, r_ospf->lstype, r_ospf->lsid, r_ospf->rtid));
+ }
+ 
+ /* Declare a generic routing table entry unreachable.
+@@ -536,7 +536,7 @@
+ 	bool local_changed;
+ 	RTRrte *abr;
+ 	AVLsearch rrsearch(&ap->abr_tbl);
+-	root = (rtrLSA *) myLSA(ap, LST_RTR, myid);
++	root = (rtrLSA *) myLSA(0, ap, LST_RTR, myid);
+ 	local_changed = (root != 0 && root->t_dest->changed);
+ 
+ 	while ((abr = (RTRrte *)rrsearch.next())) {
+diff -X exclude_files -Nabur ospfd1.28/src/spfdd.C ospfd/src/spfdd.C
+--- ospfd1.28/src/spfdd.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spfdd.C	Mon Apr  2 17:18:32 2001
+@@ -190,7 +190,7 @@
+ 	lstype = hdr->ls_type;
+ 	lsid = ntoh32(hdr->ls_id);
+ 	orig = ntoh32(hdr->ls_org);
+-	lsap = ospf->FindLSA(ap, lstype, lsid, orig);
++	lsap = ospf->FindLSA(ip, ap, lstype, lsid, orig);
+ 
+ 	if (lsap && lsap->cmp_instance(hdr) <= 0)
+ 	    continue;
+@@ -199,7 +199,7 @@
+ 	// If first entry, start link state request timer
+ 	if (n_rqlst.is_empty())
+ 	    n_rqrxtim.start(ip->if_rxmt*Timer::SECOND, false);
+-	lsap = new LSA(0, hdr, 0);
++	lsap = new LSA(0, 0, hdr, 0);
+ 	n_rqlst.addEntry(lsap);
+     }
+ }
+@@ -230,7 +230,7 @@
+     ddpkt = (DDPkt *) (n_ddpkt.spfpkt);
+     ddpkt->dd_mtu = ip->is_virtual() ? 0 : hton16(ip->mtu);
+     ddpkt->dd_seqno = hton32(n_ddseq);
+-    ddpkt->dd_opts = 0;
++    ddpkt->dd_opts = SPO_OPQ;
+     if (!ap->is_stub())
+ 	ddpkt->dd_opts |= SPO_EXT;
+     if (ospf->mospf_enabled())
+@@ -434,7 +434,7 @@
+ 	lstype = ntoh32(lsref->ls_type);
+ 	ls_id = ntoh32(lsref->ls_id);
+ 	ls_org = ntoh32(lsref->ls_org);
+-	if (!(lsap = ospf->FindLSA(ap, lstype, ls_id, ls_org))) {
++	if (!(lsap = ospf->FindLSA(ip, ap, lstype, ls_id, ls_org))) {
+ 	    nbr_fsm(NBE_BADLSREQ);
+ 	    return;
+ 	}
+diff -X exclude_files -Nabur ospfd1.28/src/spfifc.C ospfd/src/spfifc.C
+--- ospfd1.28/src/spfifc.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spfifc.C	Mon Apr  2 17:20:07 2001
+@@ -205,6 +205,7 @@
+     if_demand = false;
+     passive = 0;
+ 
++    db_xsum = 0;
+     anext = 0;
+     if_dr = 0;
+     if_bdr = 0;
+diff -X exclude_files -Nabur ospfd1.28/src/spfifc.h ospfd/src/spfifc.h
+--- ospfd1.28/src/spfifc.h	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spfifc.h	Mon Apr  2 10:57:00 2001
+@@ -150,6 +150,8 @@
+     bool in_recv_update;// in midst of processing received Link State Update?
+     bool area_flood;	// Participate in current area flood?
+     bool global_flood;	// Ditto for global scope
++    AVLtree LinkOpqLSAs;// Link-scoped Opaque-LSAs
++    uns32 db_xsum;	// Database checksum
+     // FSM action routines
+     virtual void ifa_start() = 0;
+     void ifa_nbr_start(int base_priority);
+@@ -212,6 +214,7 @@
+     bool is_multi_access();
+     SpfArea *transit_area();
+     rtid_t *vl_endpt();
++    void AddTypesToList(byte lstype, LsaList *lp);
+ 
+     // Virtual functions
+     virtual void clear_config();
+diff -X exclude_files -Nabur ospfd1.28/src/spflood.C ospfd/src/spflood.C
+--- ospfd1.28/src/spflood.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spflood.C	Tue Apr  3 16:22:22 2001
+@@ -81,9 +81,9 @@
+ 
+ 	if (!hdr->verify_cksum())
+ 	    errval = ERR_LSAXSUM;
+-	else if (!ospf->FindLSdb(ap, lstype))
++	else if (!ospf->FindLSdb(ip, ap, lstype))
+ 	    errval = ERR_BAD_LSA_TYPE;
+-	else if (lstype == LST_ASL && ap->is_stub())
++	else if (flooding_scope(lstype) == GlobalScope && ap->is_stub())
+ 	    errval = ERR_EX_IN_STUB;
+ 	else if (lstype == LST_GM && !ospf->mospf_enabled())
+ 	    continue;
+@@ -100,8 +100,8 @@
+ 	 * bit off!
+ 	 */
+ 	if ((lsage & DoNotAge) != 0) {
+-	    if ((lstype == LST_ASL && !ospf->donotage()) ||
+-		(lstype != LST_ASL && !ap->donotage())) {
++	    if ((flooding_scope(lstype) == GlobalScope && !ospf->donotage()) ||
++		(flooding_scope(lstype) == AreaScope && !ap->donotage())) {
+ 	        if (ospf->spflog(ERR_DONOTAGE, 5)) {
+ 		    ospf->log(hdr);
+ 		    ospf->log(this);
+@@ -113,7 +113,7 @@
+ 	/* Find current database copy, if any */
+ 	lsid = ntoh32(hdr->ls_id);
+ 	orig = ntoh32(hdr->ls_org);
+-	olsap = ospf->FindLSA(ap, lstype, lsid, orig);
++	olsap = ospf->FindLSA(ip, ap, lstype, lsid, orig);
+ 
+ 	/* If no instance in database, and received
+ 	 * LSA has LS age equal to MaxAge, and there
+@@ -161,7 +161,7 @@
+ 	    // Otherwise, install and flood
+ 	    if (ospf->spflog(LOG_RXNEWLSA, 1))
+ 		ospf->log(hdr);
+-	    lsap = ospf->AddLSA(ap, olsap, hdr, changes);
++	    lsap = ospf->AddLSA(ip, ap, olsap, hdr, changes);
+ 	    lsap->flood(this, hdr);
+ 	}
+ 	else if (ospf_rmreq(hdr, &rq_cmp)) {
+@@ -187,9 +187,7 @@
+ 	}
+     }
+     
+-    // Flood back out receiving interface
+-    ip->if_send_update();
+-    // Flood out other interfaces
++    // Flood out interfaces
+     ospf->send_updates();
+     ip->nbr_send(&n_imack, this);
+     ip->nbr_send(&n_update, this);
+@@ -239,12 +237,14 @@
+ 	int n_nbrs;
+ 
+ 	ap = ip->area();
+-	if (lstype == LST_ASL && ap->is_stub())
++	if (scope == GlobalScope && ap->is_stub())
+ 	    continue;
+-	if (lstype == LST_ASL && ip->is_virtual())
++	if (scope == GlobalScope && ip->is_virtual())
+ 	    continue;
+ 	if (scope == AreaScope && ap != lsa_ap)
+ 	    continue;
++	if (scope == LocalScope && ip != lsa_ifp)
++	    continue;
+ 
+ 	n_nbrs = 0;
+ 	while ((np = nbrIter.get_next())) {
+@@ -258,6 +258,9 @@
+ 		continue;
+ 	    if (lstype == LST_GM && (!np->supports(SPO_MC)))
+ 		continue;
++	    if ((lstype >= LST_LINK_OPQ && lstype <= LST_AS_OPQ)
++		&& (!np->supports(SPO_OPQ)))
++		continue;
+ 	    if (ip->demand_flooding(lstype) && !changed)
+ 	        continue;
+ 
+@@ -271,7 +274,8 @@
+ 	    (ip->state() == IFS_DR && !from->is_bdr() && n_nbrs != 0)) {
+ 	    ip->add_to_update(hdr);
+ 	}
+-	else if (r_ip == 0 && ip->in_recv_update && n_nbrs != 0)
++	else if ((r_ip == 0 && n_nbrs != 0) &&
++		 (ip->in_recv_update || scope == LocalScope))
+ 	    ip->add_to_update(hdr);
+ 	else if (ip != r_ip) {
+ 	    if (n_nbrs == 0)
+@@ -347,16 +351,23 @@
+ }
+ 
+ /* Determine whether LSAs should have DoNotAge set when
+- * flooded over this interface.
++ * flooded over this interface. For the moment, we always
++ * set DoNotAge when flooding link-scoped LSAs over
++ * a demand interfaces, although we really should check to
++ * see that all the neighbors on that interface are DoNotAge-capable.
+  */
+ 
+ bool SpfIfc::demand_flooding(byte lstype)
+ {
++    int scope;
+     if (if_demand == 0)
+ 	return(false);
+-    else if (lstype == LST_ASL)
++    scope = flooding_scope(lstype);
++    if (scope == LocalScope)
++        return(true);
++    else if (scope == GlobalScope)
+         return(ospf->donotage());
+-    else
++    else // Area scope
+         return(if_area->donotage());
+ }
+ 
+@@ -530,8 +541,10 @@
+  *
+  * On non-broadcast networks, the interface's send packet routine
+  * will actually send out separate updates to each adjacent neighbor.
+- * The special case of flooding LSAs back out the receiving
+- * interface is handled by the caller.
++ *
++ * We loop through all the interfaces in order to send
++ * a) link-scoped LSAs and b) LSAs that are flooded back out the
++ * receiving interface.
+  */
+ 
+ void OSPF::send_updates()
+@@ -540,6 +553,10 @@
+     AreaIterator aiter(this);
+     SpfArea *a;
+     SpfIfc *ip;
++    IfcIterator iiter(this);
++
++    while ((ip = iiter.get_next()))
++        ip->if_send_update();
+ 
+     // Area scope flood
+     while ((a = aiter.get_next())) {
+diff -X exclude_files -Nabur ospfd1.28/src/spforig.C ospfd/src/spforig.C
+--- ospfd1.28/src/spforig.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spforig.C	Tue Apr  3 16:27:10 2001
+@@ -35,9 +35,11 @@
+ {
+     LSA *lsap;
+     bool flush_it;
++    SpfIfc *ip;
+     SpfArea *ap;
+ 
+-    ap = np->n_ifp->area();
++    ip = np->n_ifp;
++    ap = ip->area();
+ 
+     if ((ntoh32(hdr->ls_org) != my_id()) &&
+ 	(hdr->ls_type != LST_NET || !find_ifc(ntoh32(hdr->ls_id))))
+@@ -53,7 +55,7 @@
+      * database_copy after it is replaced in database.
+      */
+     flush_it = (!database_copy) || database_copy->lsa_age() == MaxAge;
+-    lsap = AddLSA(ap, database_copy, hdr, true);
++    lsap = AddLSA(ip, ap, database_copy, hdr, true);
+     // Flush if don't want to advertise
+     // Otherwise, simply bump database copy's sequence number
+     if (ntoh32(hdr->ls_org) != my_id() || flush_it) {
+@@ -156,7 +158,7 @@
+  * Returns new LSA if originated, 0 otherwise.
+  */
+ 
+-LSA *OSPF::lsa_reorig(SpfArea *ap, LSA *olsap, LShdr *hdr, int forced)
++LSA *OSPF::lsa_reorig(SpfIfc *ip,SpfArea *ap,LSA *olsap,LShdr *hdr,int forced)
+ 
+ {
+     int changes;
+@@ -175,7 +177,7 @@
+     if (spflog(LOG_LSAORIG, 3))
+ 	log(hdr);
+     // Add to database and flood
+-    lsap = AddLSA(ap, olsap, hdr, changes);
++    lsap = AddLSA(ip, ap, olsap, hdr, changes);
+     lsap->flood(0, hdr);
+     return(lsap);
+ }
+@@ -199,7 +201,7 @@
+     for (; ls_id <= end; ls_id++) {
+ 	rteLSA *lsap;
+ 	INrte *o_rte;
+-	if (!(lsap = (rteLSA *) myLSA(ap, lstype, ls_id)))
++	if (!(lsap = (rteLSA *) myLSA(0, ap, lstype, ls_id)))
+ 	    return(true);
+ 	else if (!(o_rte = lsap->orig_rte))
+ 	    return(true);
+@@ -240,6 +242,6 @@
+ 
+     // Add to database and flood
+     // lsap may be deleted after this line
+-    nlsap = AddLSA(lsap->area(), lsap, hdr, true);
++    nlsap = AddLSA(lsap->lsa_ifp, lsap->area(), lsap, hdr, true);
+     nlsap->flood(0, hdr);
+ }
+diff -X exclude_files -Nabur ospfd1.28/src/spfpkt.h ospfd/src/spfpkt.h
+--- ospfd1.28/src/spfpkt.h	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spfpkt.h	Mon Apr  2 10:58:43 2001
+@@ -131,6 +131,7 @@
+     SPO_PROP = 0x08,	// Propagate LSA across areas (NSSA)
+     SPO_EA = 0x10,	// Implement External attributes LSA?
+     SPO_DC = 0x20,	// Implement demand circuit extensions?
++    SPO_OPQ = 0x40,	// Implement Opaque-LSAs?
+ };
+ 
+ /* Defintions of the Init/more/master/slave bits that appear in the
+diff -X exclude_files -Nabur ospfd1.28/src/spfvl.C ospfd/src/spfvl.C
+--- ospfd1.28/src/spfvl.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/spfvl.C	Tue Apr  3 11:03:31 2001
+@@ -198,7 +198,7 @@
+     Link *lp;
+ 
+     addr = 0;
+-    if (!(V = (TNode *) ospf->FindLSA(this, LST_RTR, id, id)))
++    if (!(V = (TNode *) ospf->FindLSA(0, this, LST_RTR, id, id)))
+         return(addr);
+ 
+     for (lp = V->t_links; lp != 0; lp = lp->l_next) {
+diff -X exclude_files -Nabur ospfd1.28/src/summlsa.C ospfd/src/summlsa.C
+--- ospfd1.28/src/summlsa.C	Fri Mar 16 14:06:20 2001
++++ ospfd/src/summlsa.C	Tue Apr  3 16:43:47 2001
+@@ -97,7 +97,7 @@
+ 	return;
+ 
+     // Find current LSA, if any
+-    if ((olsap = (summLSA *)ospf->myLSA(this, LST_SUMM, ls_id))) {
++    if ((olsap = (summLSA *)ospf->myLSA(0, this, LST_SUMM, ls_id))) {
+ 	o_rte = olsap->orig_rte;
+ 	olsap->orig_rte = rte;
+     }
+@@ -211,7 +211,7 @@
+     summ->mask = hton32(rte->mask());
+     summ->metric = hton32(cost);
+ 
+-    nlsap = ospf->lsa_reorig(this, olsap, hdr, forced);
++    nlsap = ospf->lsa_reorig(0, this, olsap, hdr, forced);
+     return((summLSA *)nlsap);
+ }
+ 

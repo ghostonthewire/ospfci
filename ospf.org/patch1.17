@@ -1,0 +1,413 @@
+diff -Nabur --exclude-from=exclude_files ospfd1.16/linux/ospfd_linux.C ospfd1.17/linux/ospfd_linux.C
+--- ospfd1.16/linux/ospfd_linux.C	Wed Oct 11 10:44:07 2000
++++ ospfd1.17/linux/ospfd_linux.C	Thu Oct 12 13:41:46 2000
+@@ -275,6 +275,9 @@
+ 	rtattr *rta;
+ 	int rta_len;
+ 	BSDPhyInt *phyp;
++	rtmsg *rtm;
++	InAddr net;
++	InMask mask;
+       case RTM_NEWLINK:	// Interface flags change
+ 	ifinfo = (ifinfomsg *)NLMSG_DATA(msg);
+ 	syslog(LOG_NOTICE, "Ifc change IfIndex %d flags 0x%x",
+@@ -307,6 +310,30 @@
+ 	syslog(LOG_NOTICE, "Interface addr change %s", inet_ntoa(in));
+ 	read_config();
+ 	break;
++      case RTM_DELROUTE:
++	rtm = (rtmsg *)NLMSG_DATA(msg);
++	if (rtm->rtm_protocol != PROT_OSPF)
++	    break;
++	rta_len = RTM_PAYLOAD(msg);
++	net = in.s_addr = 0;
++	mask = 0;
++	if (rtm->rtm_dst_len != 0) {
++	    for (rta = RTM_RTA(rtm); RTA_OK(rta, rta_len); 
++		 rta = RTA_NEXT(rta, rta_len)) {
++	        switch(rta->rta_type) {
++		  case RTA_DST:
++		    memcpy(&in.s_addr, RTA_DATA(rta), 4);
++		    break;
++		  default:
++		    break;
++		}
++	    }
++	    mask = ~((1 << (32-rtm->rtm_dst_len)) - 1);
++	    net = ntoh32(in.s_addr) & mask;
++	}
++	syslog(LOG_NOTICE, "Krt Delete %s", inet_ntoa(in));
++	ospf->krt_delete_notification(net, mask);
++	break;
+       default:
+ 	break;
+     }
+@@ -405,7 +432,7 @@
+     addr.nl_family = AF_NETLINK;
+     addr.nl_pad = 0;
+     addr.nl_pid = 0;
+-    addr.nl_groups = (RTMGRP_LINK | RTMGRP_IPV4_IFADDR);
++    addr.nl_groups = (RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE);
+     if (bind(rtsock, (sockaddr *)&addr, sizeof(addr)) < 0) {
+ 	syslog(LOG_ERR, "Failed to bind to rtnetlink socket: %m");
+ 	exit(1);
+diff -Nabur --exclude-from=exclude_files ospfd1.16/src/dbage.C ospfd1.17/src/dbage.C
+--- ospfd1.16/src/dbage.C	Wed Oct 11 10:44:06 2000
++++ ospfd1.17/src/dbage.C	Thu Oct 12 13:41:46 2000
+@@ -126,6 +126,8 @@
+     if (ospf->clear_mospf == true)
+         ospf->mospf_clear_cache();
+     // Process any pending LSA activity (flooding, origination)
++    // Synchronize with kernel
++    ospf->krt_sync();
+ }
+ 
+ /* Main aging routine called once a second. Increment the current
+diff -Nabur --exclude-from=exclude_files ospfd1.16/src/ospf.C ospfd1.17/src/ospf.C
+--- ospfd1.16/src/ospf.C	Wed Oct 11 10:44:06 2000
++++ ospfd1.17/src/ospf.C	Thu Oct 12 13:41:46 2000
+@@ -172,6 +172,7 @@
+     multicast_cache.clear();
+     ospf_freepkt(&o_update);
+     ospf_freepkt(&o_demand_upd);
++    krtdeletes.clear();
+ 
+     // Reinitialize statics
+     for (int i= 0; i < MaxAge+1; i++)
+@@ -558,6 +559,25 @@
+         phyp->operational = false;
+ 	phyp->verify_igmp_capabilities();
+     }
++
++    // Delete phyint from routing table entries' next hops
++    INrte *rte;
++    INiterator rtiter(inrttbl);
++    while ((rte = rtiter.nextrte())) {
++        MPath *old;
++        if (!rte->valid())
++	    continue;
++	if (!rte->r_mpath)
++	    continue;
++	old = rte->r_mpath;
++	rte->r_mpath = old->prune_phyint(phyint);
++	if (!rte->r_mpath)
++	    rte->declare_unreachable();
++	if (rte->r_mpath != old) {
++	    rte->changed = true;
++	    rte->sys_install();
++	}
++    }
+ }
+ 
+ /* An indication that the physical and data link layers
+@@ -566,6 +586,11 @@
+  * Redo the external routing calculation in case the
+  * physical interface contains non-OSPF subnets which
+  * are referenced in imported external routes.
++ *
++ * In additional, force a routing calculation because a
++ * previous phy_down() deleted routing table entries, and
++ * if LSAs have not changed (say because of a quick link
++ * flap) we need to put them back.
+  */
+ 
+ 
+@@ -577,8 +602,11 @@
+ 
+     ase_sched = true;
+     while ((ip = iter.get_next())) {
+-	if (ip->if_phyint == phyint)
++        if (ip->if_phyint == phyint) {
+ 	    ip->run_fsm(IFE_UP);
++	    full_sched = true;
++	    ase_sched = true;
++	}
+     }
+ }
+ 
+@@ -637,6 +665,25 @@
+ 	}
+     }
+     delete gentry;
++}
++
++/* Kernel has indicated that it has deleted one of the
++ * routes that we have added. This is probably due to
++ * a network interface going down. Store the information
++ * so that if we don't soon delete the entry also, we
++ * will re-add it to the kernel in OSPF::krt_sync().
++ */
++
++void OSPF::krt_delete_notification(InAddr net, InMask mask)
++
++{
++    INrte *rte;
++
++    if ((rte = inrttbl->find(net, mask)) && rte->valid()) {
++        KrtSync *item;
++	item = new KrtSync(net, mask);
++	krtdeletes.add(item);
++    }
+ }
+ 
+ /* Perform a lookup in OSPF's copy of the IP routing
+diff -Nabur --exclude-from=exclude_files ospfd1.16/src/ospf.h ospfd1.17/src/ospf.h
+--- ospfd1.16/src/ospf.h	Wed Oct 11 10:44:06 2000
++++ ospfd1.17/src/ospf.h	Thu Oct 12 13:41:46 2000
+@@ -83,6 +83,7 @@
+     int	countdown;	// Number of seconds before exit
+     bool delete_neighbors; // Neighbors being deleted?
+     AVLtree phyints;	// Physical interfaces
++    AVLtree krtdeletes;	// Deleted, unsynced kernel routing entries
+     // Flooding queues
+     int	n_local_flooded;// AS-external-LSAs originated this tick
+     ExRtData *ases_pending; // Pending AS-external-LSA originations
+@@ -230,6 +231,7 @@
+     void update_area_ranges(INrte *rte);
+     void advertise_ranges();
+     void do_all_ases();
++    void krt_sync();
+     
+     // MOSPF routines
+     INrte *mc_source(InAddr src);
+@@ -258,7 +260,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 16,	// Minor version number
++	vminor = 17,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+@@ -274,6 +276,7 @@
+     void leave_indication(InAddr group, int phyint);
+     void phy_up(int phyint);
+     void phy_down(int phyint);
++    void krt_delete_notification(InAddr net, InMask mask);
+     MPath *ip_lookup(InAddr dest);
+     InAddr ip_source(InAddr dest);
+     InAddr if_addr(int phyint);
+diff -Nabur --exclude-from=exclude_files ospfd1.16/src/rte.C ospfd1.17/src/rte.C
+--- ospfd1.16/src/rte.C	Wed Oct 11 10:44:06 2000
++++ ospfd1.17/src/rte.C	Thu Oct 12 13:41:46 2000
+@@ -21,6 +21,7 @@
+  */
+ 
+ #include "ospfinc.h"
++#include "ifcfsm.h"
+ 
+ /* Display strings for the various routing table types.
+  * Must match the enum defining RT_SPF, etc.
+@@ -52,7 +53,7 @@
+ {
+     NH paths[MAXPATH];
+ 
+-    if (ip->is_virtual())
++    if (ip->is_virtual() || ip->state() == IFS_DOWN)
+ 	return(0);
+     paths[0].if_addr = ip->if_addr;
+     paths[0].phyint = ip->if_phyint;
+@@ -143,6 +144,8 @@
+     int i, j;
+     int n_paths = mp->npaths;
+ 
++    if (!mp)
++        return(0);
+     for (i = 0, j = 0; i < mp->npaths; i++, j++) {
+ 	SpfIfc *ip;
+ 	paths[j] = mp->NHs[i];
+@@ -175,6 +178,43 @@
+     return(modified ? create(n_paths, paths) : mp);
+ }
+ 
++/* Prune all the next hops going over a particular phyint
++ * from a multipath entry. This is done when a physical
++ * interface becomes inoperational. If all next hops are
++ * pruned, 0 is returned.
++ */
++
++MPath *MPath::prune_phyint(int phyint)
++
++{
++    bool modified=false;
++    NH paths[MAXPATH];
++    int i, j;
++
++    // Previously cached result?
++    if (phyint == pruned_phyint)
++        return(pruned_mpath);
++
++    // Remove next hops referencing phyint
++    for (i = 0, j = 0; i < npaths; i++) {
++        if (NHs[i].phyint == phyint) {
++	    modified = true;
++	    continue;
++	}
++	paths[j++] = NHs[i];
++    }
++
++    pruned_phyint = phyint;
++    if (j == 0)
++        pruned_mpath = 0;
++    else if (!modified)
++        pruned_mpath = this;
++    else
++        pruned_mpath = create(j, paths);
++
++    return(pruned_mpath);
++}
++
+ /* Look for an entry in the multipath database. If it's not
+  * already there, create it and add to the database.
+  * Argument assumed to be an array of size MAXPATH.
+@@ -203,6 +243,8 @@
+     entry->npaths = n_paths;
+     for (i = 0; i < MAXPATH; i++)
+ 	entry->NHs[i] = paths[i];
++    entry->pruned_phyint = -1;
++    entry->pruned_mpath = 0;
+     // Add to database
+     entry->key = (byte *) entry->NHs;
+     entry->keylen = len;
+diff -Nabur --exclude-from=exclude_files ospfd1.16/src/rte.h ospfd1.17/src/rte.h
+--- ospfd1.16/src/rte.h	Wed Oct 11 10:44:06 2000
++++ ospfd1.17/src/rte.h	Thu Oct 12 13:41:46 2000
+@@ -36,12 +36,15 @@
+   public:
+     int	npaths;
+     NH	NHs[MAXPATH];
++    int pruned_phyint;
++    MPath *pruned_mpath;
+     static PatTree nhdb;
+     static MPath *create(int, NH *);
+     static MPath *create(SpfIfc *, InAddr);
+     static MPath *create(int, InAddr);
+     static MPath *merge(MPath *, MPath *);
+     static MPath *addgw(MPath *, InAddr);
++    MPath *prune_phyint(int phyint);
+     bool all_in_area(class SpfArea *);
+ };	
+ 
+@@ -421,3 +424,15 @@
+ {
+     return(index1());
+ }
++
++/* Data structure used to store differences between the
++ * kernel routing table and OSPF's. Time is when the
++ * kernel has reported a deletion that we didn't know
++ * about.
++ */
++
++class KrtSync : public AVLitem {
++  public:
++    SPFtime tstamp;
++    KrtSync(InAddr net, InMask mask);
++};
+diff -Nabur --exclude-from=exclude_files ospfd1.16/src/spfcalc.C ospfd1.17/src/spfcalc.C
+--- ospfd1.16/src/spfcalc.C	Wed Oct 11 10:44:06 2000
++++ ospfd1.17/src/spfcalc.C	Thu Oct 12 13:41:46 2000
+@@ -624,8 +624,15 @@
+ void INrte::sys_install()
+ 
+ {
++    AVLitem *item;
+     int msgno;
+ 
++    // We're about to synchronize with the kernel
++    if ((item = ospf->krtdeletes.find(net(), mask()))) {
++        ospf->krtdeletes.remove(item);
++	delete item;
++    }
++
+     switch(r_type) {
+       case RT_NONE:
+ 	msgno = LOG_DELRT;
+@@ -665,6 +672,52 @@
+         ase_orig = false;
+ 	ospf->ase_orig(this, 0);
+     }
++}
++
++/* Resynchronize the routing table by re-adding routes that
++ * the kernel deleted fror some unknown reason.
++ */
++
++void OSPF::krt_sync()
++
++{
++    AVLsearch iter(&krtdeletes);
++    KrtSync *item;
++
++    if (shutting_down())
++        return;
++
++    while ((item = (KrtSync *)iter.next())) {
++        InAddr net;
++	InMask mask;
++	INrte *rte;
++	if (time_diff(sys_etime, item->tstamp) < 5*Timer::SECOND)
++	    continue;
++	net = item->index1();
++	mask = item->index2();
++	krtdeletes.remove(item);
++	delete item;
++	rte = inrttbl->find(net, mask);
++	if (!rte || !rte->valid())
++	    continue;
++	if (ospf->spflog(LOG_KRTSYNC, 5))
++	    ospf->log(rte);
++	sys->rtadd(net, mask, rte->r_mpath, rte->last_mpath, 
++		   rte->r_type == RT_REJECT);
++    }
++}
++
++/* When we construct the entry indicating that the
++ * kernel deleted a route before we did, note the
++ * time so that we can wait long enough to know whether
++ * we should re-add it. Must wait until an updated LSA
++ * is reissued and the routing calculation is rerun.
++ */
++
++KrtSync::KrtSync(InAddr net, InMask mask) : AVLitem(net, mask)
++
++{
++    tstamp = sys_etime;
+ }
+ 
+ /* (Re)resolve the reachability and cost of all forwarding
+diff -Nabur --exclude-from=exclude_files ospfd1.16/src/spflog.h ospfd1.17/src/spflog.h
+--- ospfd1.16/src/spflog.h	Wed Oct 11 10:44:06 2000
++++ ospfd1.17/src/spflog.h	Thu Oct 12 13:41:46 2000
+@@ -82,6 +82,7 @@
+     LOG_GRPEXP,		// Group expired
+     IGMP_RCV,		// Received IGMP packet
+     LOG_SPFDEBUG,	// Debug statements
++    LOG_KRTSYNC,	// Synch kernel routing entry
+     MAXLOG,		// KEEP THIS LAST!!!!
+ };
+ 
+diff -Nabur --exclude-from=exclude_files ospfd1.16/src/spfutil.C ospfd1.17/src/spfutil.C
+--- ospfd1.16/src/spfutil.C	Wed Oct 11 10:44:06 2000
++++ ospfd1.17/src/spfutil.C	Thu Oct 12 13:41:46 2000
+@@ -406,6 +406,8 @@
+ 	return("Received IGMP packet, type");
+       case LOG_SPFDEBUG:
+ 	return("DEBUG");
++      case LOG_KRTSYNC:
++	return("Synching kernel routing entry");
+       default:
+ 	break;
+     }
+diff -Nabur --exclude-from=exclude_files ospfd1.16/src/summlsa.C ospfd1.17/src/summlsa.C
+--- ospfd1.16/src/summlsa.C	Wed Oct 11 10:44:06 2000
++++ ospfd1.17/src/summlsa.C	Thu Oct 12 13:41:46 2000
+@@ -363,8 +363,6 @@
+     if (new_type == RT_NONE &&
+ 	(r_type == RT_SPFIA || r_type == RT_REJECT)) {
+ 	declare_unreachable();
+-	sys->rtdel(net(), mask(), last_mpath);
+-	last_mpath = 0;
+ 	changed = true;
+ 	return;
+     }

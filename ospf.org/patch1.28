@@ -1,0 +1,76 @@
+diff -X exclude_files -Nabur ospfd1.27/linux/ospfd_browser.C ospfd1.28/linux/ospfd_browser.C
+--- ospfd1.27/linux/ospfd_browser.C	Wed Feb 28 12:51:13 2001
++++ ospfd1.28/linux/ospfd_browser.C	Fri Mar 16 14:06:23 2001
+@@ -40,7 +40,7 @@
+ void print_lsa(LShdr *hdr);
+ 
+ // Forward references
+-char *yesorno(byte val);
++const char *yesorno(byte val);
+ void get_statistics(bool print);
+ int get_areas(bool print);
+ void get_interfaces();
+@@ -1524,7 +1524,7 @@
+ /* Non-zero values signal enabled.
+  */
+ 
+-char *yesorno(byte val)
++const char *yesorno(byte val)
+ 
+ {
+     return((val != 0) ? "yes" : "no");
+diff -X exclude_files -Nabur ospfd1.27/linux/ospfd_mon.C ospfd1.28/linux/ospfd_mon.C
+--- ospfd1.27/linux/ospfd_mon.C	Wed Feb 28 12:51:10 2001
++++ ospfd1.28/linux/ospfd_mon.C	Fri Mar 16 14:06:21 2001
+@@ -52,7 +52,7 @@
+ void get_lsa();
+ void get_rttbl();
+ void print_pair(char *, int, int);
+-char *yesorno(byte val);
++const char *yesorno(byte val);
+ void prompt();
+ void syntax();
+ 
+@@ -801,7 +801,7 @@
+     }
+ }
+ 
+-char *yesorno(byte val)
++const char *yesorno(byte val)
+ 
+ {
+     return((val != 0) ? "yes" : "no");
+diff -X exclude_files -Nabur ospfd1.27/src/ospf.h ospfd1.28/src/ospf.h
+--- ospfd1.27/src/ospf.h	Wed Feb 28 12:51:09 2001
++++ ospfd1.28/src/ospf.h	Fri Mar 16 14:06:20 2001
+@@ -265,7 +265,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 27,	// Minor version number
++	vminor = 28,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -X exclude_files -Nabur ospfd1.27/src/rte.C ospfd1.28/src/rte.C
+--- ospfd1.27/src/rte.C	Wed Feb 28 12:51:09 2001
++++ ospfd1.28/src/rte.C	Fri Mar 16 14:06:20 2001
+@@ -260,14 +260,17 @@
+ 
+ {
+     int i;
++    bool retval=false;
+ 
+     for (i = 0; i < npaths; i++) {
+         SpfIfc *ip;
+         ip = ospf->find_ifc(NHs[i].if_addr, NHs[i].phyint);
+ 	if (ip && ip->area() != a)
+ 	    return(false);
++	else
++	    retval = true;
+     }
+-    return(true);
++    return(retval);
+ }
+ 
+ /* Determine whether some of the next hops go through

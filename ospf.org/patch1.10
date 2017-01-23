@@ -1,0 +1,26 @@
+diff -abur --exclude-from=exclude_files ospfd1.9/src/ospf.h ospfd1.10/src/ospf.h
+--- ospfd1.9/src/ospf.h	Mon Jun  5 15:03:33 2000
++++ ospfd1.10/src/ospf.h	Mon Jun 26 17:54:48 2000
+@@ -258,7 +258,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 9,	// Minor version number
++	vminor = 10,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -abur --exclude-from=exclude_files ospfd1.9/src/spfcalc.C ospfd1.10/src/spfcalc.C
+--- ospfd1.9/src/spfcalc.C	Mon Jun  5 15:03:34 2000
++++ ospfd1.10/src/spfcalc.C	Mon Jun 26 17:54:48 2000
+@@ -794,6 +794,10 @@
+     if (intra_AS() && r_mpath == 0)
+ 	declare_unreachable();
+     if (state_changed() || otype != r_type || oa != area()) {
++	// Clear changed flag
++        changed = false;
++	// Install in kernel routing table
++	sys_install();
+ 	// Originate new summary-LSA
+ 	ospf->sl_orig(this);
+ 	// Recalculate forwarding addresses

@@ -1,0 +1,370 @@
+diff -X exclude_files -Nabur ospfd1.22/linux/ospfd.tcl ospfd1.23/linux/ospfd.tcl
+--- ospfd1.22/linux/ospfd.tcl	Wed Jan 17 16:00:04 2001
++++ ospfd1.23/linux/ospfd.tcl	Fri Jan 19 15:20:44 2001
+@@ -48,6 +48,7 @@
+ set global_att(host) 0
+ set global_att(refresh_rate) 0
+ set global_att(PPAdjLimit) 0
++set global_att(random_refresh) 0
+ 
+ ###############################################################
+ # Top-level commands to set global parameters
+@@ -64,6 +65,7 @@
+ #	log_level %no
+ #	refresh_rate %seconds
+ #	PPAdjLimit %no
++#	random_refresh
+ ###############################################################
+ 
+ proc ospfExtLsdbLimit {val} {
+@@ -110,6 +112,10 @@
+     global global_att
+     set global_att(PPAdjLimit) $nadj
+ }
++proc random_refresh {} {
++    global global_att
++    set global_att(random_refresh) 1
++}
+ 
+ ###############################################################
+ # Area configuration:
+@@ -437,7 +443,7 @@
+ 	    $global_att(new_flood_rate) $global_att(max_rxmt_window) \
+ 	    $global_att(max_dds) $global_att(base_level) \
+ 	    $global_att(host) $global_att(refresh_rate) \
+-	    $global_att(PPAdjLimit)
++	    $global_att(PPAdjLimit) $global_att(random_refresh)
+     foreach a $areas {
+ 	sendarea $a $area_att($a,stub) $area_att($a,dflt_cost) \
+ 		$area_att($a,import_summs)
+diff -X exclude_files -Nabur ospfd1.22/linux/ospfd_linux.C ospfd1.23/linux/ospfd_linux.C
+--- ospfd1.22/linux/ospfd_linux.C	Wed Jan 17 16:00:04 2001
++++ ospfd1.23/linux/ospfd_linux.C	Fri Jan 19 15:20:44 2001
+@@ -808,6 +808,7 @@
+     m.log_priority = atoi(argv[8]);
+     m.refresh_rate = atoi(argv[10]);
+     m.PPAdjLimit = atoi(argv[11]);
++    m.random_refresh = atoi(argv[12]);
+     ospf->cfgOspf(&m);
+ 
+     return(TCL_OK);
+diff -X exclude_files -Nabur ospfd1.22/ospf_sim/ospf_sim.tcl ospfd1.23/ospf_sim/ospf_sim.tcl
+--- ospfd1.22/ospf_sim/ospf_sim.tcl	Wed Jan 17 16:00:07 2001
++++ ospfd1.23/ospf_sim/ospf_sim.tcl	Fri Jan 19 15:20:46 2001
+@@ -40,6 +40,7 @@
+ global {vlinks}
+ global {sessions}
+ global {session_ids}
++global {random_refresh_flag}
+ 
+ set routers {}
+ set areas {}
+@@ -55,6 +56,7 @@
+ set neighbor_index 0
+ set port_index 0
+ set session_ids 0
++set random_refresh_flag 0
+ 
+ set PING 0
+ set TRACEROUTE 1
+@@ -404,6 +406,15 @@
+ }
+ 
+ ###############################################################
++# Set *all* simulated routers to randomly refresh.
++# By default, this function is disabled.
++###############################################################
++
++proc random_refresh {} {
++    global random_refresh_flag
++    set random_refresh_flag 1
++}
++###############################################################
+ # Send entire configuration to a
+ # given router (i.e., simulated ospfd).
+ ###############################################################
+@@ -411,9 +422,9 @@
+ proc sendcfg {rtr_id} {
+     global router_att area_att ifc_att vlink_att
+     global aggr_att route_att host_att nbr_att node_att
+-    global networks network_att
++    global networks network_att random_refresh_flag
+     sendgen $rtr_id $router_att($rtr_id,host) $router_att($rtr_id,mospf) \
+-	    $router_att($rtr_id,PPAdjLimit)
++	    $router_att($rtr_id,PPAdjLimit) $random_refresh_flag
+     foreach a $router_att($rtr_id,areas) {
+ 	sendarea $rtr_id $a $area_att($a,stub) $area_att($a,default_cost) \
+ 		$area_att($a,import)
+@@ -1400,9 +1411,12 @@
+     global router_att area_att ifc_att vlink_att vlinks
+     global aggr_att route_att host_att nbr_att node_att
+     global network_att aggr_att route_att nbr_att
+-    global host_att
++    global host_att random_refresh_flag
+ 
+     set f [open $config_file w]
++    if {$random_refresh_flag != 0} {
++	puts $f "random_refresh"
++    }
+     foreach id $routers {
+ 	if {$router_att($id,host) == 0} {
+ 	    puts $f [concat "router" $id $node_att($id,x) $node_att($id,y) \
+diff -X exclude_files -Nabur ospfd1.22/ospf_sim/sim.C ospfd1.23/ospf_sim/sim.C
+--- ospfd1.22/ospf_sim/sim.C	Wed Jan 17 16:00:07 2001
++++ ospfd1.23/ospf_sim/sim.C	Fri Jan 19 15:20:46 2001
+@@ -942,6 +942,7 @@
+     m.log_priority = 2;
+     m.refresh_rate = 6000;
+     m.PPAdjLimit = atoi(argv[4]);
++    m.random_refresh = atoi(argv[5]);
+     node->pktdata.queue_xpkt(&m, SIM_CONFIG, CfgType_Gen, len);
+ 
+     return(TCL_OK);
+diff -X exclude_files -Nabur ospfd1.22/src/config.h ospfd1.23/src/config.h
+--- ospfd1.22/src/config.h	Wed Jan 17 16:00:04 2001
++++ ospfd1.23/src/config.h	Fri Jan 19 15:20:44 2001
+@@ -55,6 +55,7 @@
+     int log_priority;	// Logging message priority
+     int32 refresh_rate;	// Rate to refresh DoNotAge LSAs
+     uns32 PPAdjLimit;	// Max # p-p adjacencies to neighbor
++    int random_refresh;	// Should we spread out LSA refreshes?
+ 
+     void set_defaults();
+ };
+diff -X exclude_files -Nabur ospfd1.22/src/dbage.C ospfd1.23/src/dbage.C
+--- ospfd1.22/src/dbage.C	Wed Jan 17 16:00:04 2001
++++ ospfd1.23/src/dbage.C	Fri Jan 19 15:20:44 2001
+@@ -27,6 +27,8 @@
+ // Declarations of statics
+ LSA *LSA::AgeBins[MaxAge+1];	// Aging Bins
+ int LSA::Bin0;			// Current age 0 bin
++int32 LSA::RefreshBins[MaxAgeDiff];// Refresh bins
++int LSA::RefreshBin0;		// Current refresh bin
+ 
+ 
+ /* Start aging an LSA. Remove it from an existing bin, if necessary.
+@@ -162,6 +164,7 @@
+     refresh_lsas();
+     maxage_lsas();
+     refresh_donotages();
++    do_random_refreshes();
+ 
+     // Finish any flooding that was caused by age routines
+     send_updates();
+@@ -259,11 +262,8 @@
+ 	next_lsa = lsap->lsa_agefwd;
+ 	if (lsap->do_not_age())
+ 	    continue;
+-	if (lsap->adv_rtr() == myid) {
+-	    if (spflog(LOG_LSAREFR, 1))
+-		log(lsap);
+-	    lsap->reoriginate(true);
+-	}
++	if (lsap->adv_rtr() == myid)
++	    schedule_refresh(lsap);
+     }
+ }
+ 
+@@ -322,11 +322,8 @@
+ 	    continue;
+ 	if (!lsap->do_not_age())
+ 	    continue;
+-	if (lsap->lsa_hour >= hour) {
+-	    if (spflog(LOG_DNAREFR, 1))
+-		log(lsap);
+-	    lsap->reoriginate(true);
+-	}
++	if (lsap->lsa_hour >= hour)
++	    schedule_refresh(lsap);
+     }
+ }
+ 
+@@ -461,4 +458,70 @@
+ 	}
+ 	delete iter;
+     }
++}
++
++/* The official time to refresh a given LSA has arrived.
++ * If configured to randomly refresh, delay the refresh
++ * randomly up to MaxAgeDiff seconds. Otherwise (the default)
++ * refresh the LSA immediately by forcing a reorigination.
++ */
++
++void OSPF::schedule_refresh(LSA *lsap)
++
++{
++    int slot;
++
++    if (!random_refresh) {
++	int msgno;
++	msgno = lsap->do_not_age() ? LOG_DNAREFR : LOG_LSAREFR;
++	if (spflog(msgno, 1))
++	    log(lsap);
++        lsap->reoriginate(true);
++    }
++
++    /* We are going to randomly delay reorigination
++     * until some time in the next MaxAgeDiff
++     * seconds. Note: we don't care where the current
++     * refresh bin is.
++     */
++    slot = Timer::random_period(MaxAgeDiff);
++    if (slot < 0 || slot >= MaxAgeDiff)
++        slot = LSA::RefreshBin0;
++    LSA::RefreshBins[slot]++;
++    pending_refresh.addEntry(lsap);
++}
++
++/* Go through the list of delayed originations, and refresh
++ * the number that have been scheduled for this 
++ * timeslot (width one second). LSAs that have already
++ * been overwritten or deleted still count against the tally,
++ * but are of course not refreshed.
++ */
++
++void OSPF::do_random_refreshes()
++
++{
++    int count;
++    LSA *lsap;
++    LsaListIterator iter(&pending_refresh);
++
++    count = LSA::RefreshBins[LSA::RefreshBin0];
++    LSA::RefreshBins[LSA::RefreshBin0] = 0;
++    // Refresh up to count LSAs
++    for (; count > 0 && (lsap = iter.get_next()); count--) {
++        int msgno;
++	if (!lsap->valid() || lsap->lsa_age() == MaxAge) {
++	    iter.remove_current();
++	    continue;
++	}
++	msgno = lsap->do_not_age() ? LOG_DNAREFR : LOG_LSAREFR;
++	if (spflog(msgno, 1))
++	    log(lsap);
++	iter.remove_current();
++        lsap->reoriginate(true);
++    }
++
++    LSA::RefreshBin0++;
++    if (LSA::RefreshBin0 >= MaxAgeDiff)
++        LSA::RefreshBin0 = 0;
+ }
+diff -X exclude_files -Nabur ospfd1.22/src/lsa.h ospfd1.23/src/lsa.h
+--- ospfd1.22/src/lsa.h	Wed Jan 17 16:01:27 2001
++++ ospfd1.23/src/lsa.h	Fri Jan 19 15:20:44 2001
+@@ -61,6 +61,8 @@
+ 
+     static  LSA *AgeBins[MaxAge+1];// Aging Bins
+     static int Bin0;	// Current age 0 bin
++    static int32 RefreshBins[MaxAgeDiff]; // Refresh bins
++    static int RefreshBin0; // Current refresh bin
+ 
+     void hdr_parse(LShdr *hdr);
+     virtual void parse(LShdr *);
+diff -X exclude_files -Nabur ospfd1.22/src/ospf.C ospfd1.23/src/ospf.C
+--- ospfd1.22/src/ospf.C	Wed Jan 17 16:00:04 2001
++++ ospfd1.23/src/ospf.C	Fri Jan 19 15:20:44 2001
+@@ -69,6 +69,7 @@
+     host_mode = 0;		// act as router
+     refresh_rate = 0;		// Don't originate DoNotAge LSAs
+     PPAdjLimit = 0;		// Don't limit p-p adjacencies
++    random_refresh = false;
+ 
+     myaddr = 0;
+     n_extImports = 0;
+@@ -168,6 +169,7 @@
+     replied_list.clear();
+     MaxAge_list.clear();
+     dbcheck_list.clear();
++    pending_refresh.clear();
+     ospfd_membership.clear();
+     local_membership.clear();
+     multicast_cache.clear();
+@@ -179,6 +181,9 @@
+     for (int i= 0; i < MaxAge+1; i++)
+         LSA::AgeBins[i] = 0;
+     LSA::Bin0 = 0;
++    for (int i= 0; i < MaxAgeDiff; i++)
++        LSA::RefreshBins[i] = 0;
++    LSA::RefreshBin0 = 0;
+ }
+ 
+ /* Configure global OSPF parameters. Certain parameter
+@@ -237,6 +242,8 @@
+     base_priority = m->log_priority;
+     refresh_rate = m->refresh_rate;
+     PPAdjLimit = m->PPAdjLimit;
++    random_refresh = (m->random_refresh != 0);
++
+     sys->ip_forward(host_mode == 0);
+ 
+     updated = true;
+@@ -263,6 +270,7 @@
+     host_mode = 0;	// act as router
+     log_priority = 4;	// Base logging priority
+     refresh_rate = 0;	// Don't originate DoNotAge LSAs
++    random_refresh = false; // Don't spread out LSA refreshes
+     PPAdjLimit = 0;	// Don't limit p-p adjacencies
+     sys->ip_forward(true);
+ }
+diff -X exclude_files -Nabur ospfd1.22/src/ospf.h ospfd1.23/src/ospf.h
+--- ospfd1.22/src/ospf.h	Fri Jan 19 15:13:57 2001
++++ ospfd1.23/src/ospf.h	Fri Jan 19 15:20:44 2001
+@@ -58,6 +58,7 @@
+     byte host_mode;	// Don't forward data packets?
+     int32 refresh_rate;	// Rate to refresh DoNotAge LSAs
+     uns32 PPAdjLimit;	// Max # p-p adjacencies to neighbor
++    bool random_refresh;// Should we spread out LSA refreshes?
+     // Dynamic data
+     InAddr myaddr;	// Global address: source on unnumbered
+     bool wakeup; 	// Timers running?
+@@ -97,6 +98,7 @@
+     LsaList MaxAge_list; // MaxAge LSAs, being flushed
+     uns32 total_lsas;	// Total number of LSAs in all databases
+     LsaList dbcheck_list; // LSAs whose checksum is being verified
++    LsaList pending_refresh; // LSAs awaiting refresh
+     // Database Overflow variables
+     bool OverflowState;	// true => database has overflowed
+     ExitOverflowTimer oflwtim; // Exit overflow timer
+@@ -198,6 +200,8 @@
+     void refresh_donotages();
+     void free_maxage_lsas();
+     void donotage_changes();
++    void schedule_refresh(LSA *);
++    void do_random_refreshes();
+ 
+     // LSA origination
+     int	self_originated(SpfArea *ap, LShdr *hdr, LSA *database_copy);
+@@ -261,7 +265,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 22,	// Minor version number
++	vminor = 23,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -X exclude_files -Nabur ospfd1.22/src/timer.C ospfd1.23/src/timer.C
+--- ospfd1.22/src/timer.C	Wed Jan 17 16:00:04 2001
++++ ospfd1.23/src/timer.C	Fri Jan 19 15:20:44 2001
+@@ -29,7 +29,7 @@
+  * Used to jitter timers.
+  */
+ 
+-static int random_period(int period)
++static int Timer::random_period(int period)
+ 
+ {
+     float fperiod = period;
+diff -X exclude_files -Nabur ospfd1.22/src/timer.h ospfd1.23/src/timer.h
+--- ospfd1.22/src/timer.h	Wed Jan 17 16:00:04 2001
++++ ospfd1.23/src/timer.h	Fri Jan 19 15:20:44 2001
+@@ -36,6 +36,7 @@
+ 	period = 0;
+     }
+ 
++    static int random_period(int period);
+     void stop();
+     void restart(int millseconds=0);// Stop and start again
+     inline int is_running();

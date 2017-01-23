@@ -1,0 +1,41 @@
+diff -abur --exclude-from=exclude_files ospfd1.8/src/ospf.h ospfd1.9/src/ospf.h
+--- ospfd1.8/src/ospf.h	Mon Jun  5 15:49:52 2000
++++ ospfd1.9/src/ospf.h	Mon Jun  5 15:03:33 2000
+@@ -258,7 +258,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 4,	// Minor version number
++	vminor = 9,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -abur --exclude-from=exclude_files ospfd1.8/src/spfvl.C ospfd1.9/src/spfvl.C
+--- ospfd1.8/src/spfvl.C	Mon Jun  5 15:49:44 2000
++++ ospfd1.9/src/spfvl.C	Mon Jun  5 15:03:34 2000
+@@ -78,6 +78,9 @@
+     tap->updated = true;
+     bb = FindArea(BACKBONE);
+     bb->updated = true;
++
++    // If endpoint reachable, bring up the link
++    ip->update(endpt);
+ }
+ 
+ /* Constructor for a virtual link. Link together
+@@ -142,6 +145,7 @@
+     // Must have intra-area route through
+     // a non-stub area
+     if (endpt->type() != RT_SPF || ap->is_stub()) {
++        if_cost = 0xffff;
+ 	run_fsm(IFE_DOWN);
+ 	return;
+     }
+@@ -155,6 +159,7 @@
+         if_addr = ap->id_to_addr(ospf->my_id());
+     if_rmtaddr = ap->id_to_addr(endpt->rtrid());
+     if (byte0(if_addr) == 0 || byte0(if_rmtaddr) == 0) {
++        if_cost = 0xffff;
+ 	run_fsm(IFE_DOWN);
+ 	return;
+     }

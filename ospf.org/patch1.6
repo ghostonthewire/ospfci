@@ -1,0 +1,249 @@
+Only in ospfd1.5/linux: core
+diff -abur --exclude-from=exclude_files ospfd1.5/src/ifcfsm.C ospfd1.6/src/ifcfsm.C
+--- ospfd1.5/src/ifcfsm.C	Wed May 24 11:00:30 2000
++++ ospfd1.6/src/ifcfsm.C	Tue May 30 17:00:51 2000
+@@ -111,6 +111,10 @@
+     int llevel;
+     int	if_ostate;	// Previous interface state
+ 
++    // Don't process state transitions on loopback interfaces
++    if (type() == IFT_LOOPBK)
++        return;
++
+     if_ostate = if_state;
+     action = ospf->run_fsm(&IfcFsm[0], if_state, event);
+ 
+diff -abur --exclude-from=exclude_files ospfd1.5/src/spfifc.C ospfd1.6/src/spfifc.C
+--- ospfd1.5/src/spfifc.C	Wed May 24 11:00:30 2000
++++ ospfd1.6/src/spfifc.C	Tue May 30 17:00:51 2000
+@@ -256,6 +256,15 @@
+ 	ospf->phy_detach(if_phyint, if_addr);
+ }
+ 
++/* Return the physical interface type.
++ */
++
++int SpfIfc::type()
++
++{
++    return(if_type);
++}
++
+ /* Return a printable string for each interface type
+  */
+ 
+@@ -322,10 +331,6 @@
+ /* Trivial virtual functions for point-to-point interfaces.
+  */
+ 
+-int PPIfc::type()
+-{
+-    return(IFT_PP);
+-}
+ bool PPIfc::is_multi_access()
+ {
+     return(false);
+@@ -334,10 +339,6 @@
+ /* Trivial virtual functions for virtual links.
+  */
+ 
+-int VLIfc::type()
+-{
+-    return(IFT_VL);
+-}
+ SpfArea *VLIfc::transit_area()
+ {
+     return(if_tap);
+@@ -364,18 +365,9 @@
+ /* Trivial virtual functions for Broadcast interfaces.
+  */
+ 
+-int BroadcastIfc::type()
+-{
+-    return(IFT_BROADCAST);
+-}
+-
+ /* Trivial virtual functions for NBMA interfaces.
+  */
+ 
+-int NBMAIfc::type()
+-{
+-    return(IFT_NBMA);
+-}
+ void NBMAIfc::if_send(Pkt *pdesc, InAddr addr)
+ {
+     nonbroadcast_send(pdesc, addr);
+@@ -397,10 +389,6 @@
+ /* Trivial virtual functions for Point-to-MultiPoint interfaces.
+  */
+ 
+-int P2mPIfc::type()
+-{
+-    return(IFT_P2MP);
+-}
+ void P2mPIfc::if_send(Pkt *pdesc, InAddr addr)
+ {
+     nonbroadcast_send(pdesc, addr);
+@@ -424,32 +412,29 @@
+ LoopIfc::LoopIfc(SpfArea *a, InAddr net, InMask mask) : SpfIfc(net, -1)
+ 
+ {
++    if_type = IFT_LOOPBK;
+     if_area = a;
+     if_mask = mask;
+     if_net = if_addr & if_mask;
+     if_state = IFS_LOOP;
+ }
+ 
+-void LoopIfc::ifa_start()
+-{
+-}
++LoopIfc::~LoopIfc()
+ 
+-RtrLink *LoopIfc::rl_insert(RTRhdr *, RtrLink *)
+ {
+-    return(0);
++    if_state = IFS_DOWN;
+ }
+ 
+-void LoopIfc::add_adj_to_cand(class PriQ &)
++void LoopIfc::ifa_start()
+ {
+ }
+ 
+-int LoopIfc::type()
++RtrLink *LoopIfc::rl_insert(RTRhdr *, RtrLink *)
+ {
+-  return(IFT_LOOPBK);
++    return(0);
+ }
+ 
+-void LoopIfc::run_fsm(int)
+-
++void LoopIfc::add_adj_to_cand(class PriQ &)
+ {
+ }
+ 
+diff -abur --exclude-from=exclude_files ospfd1.5/src/spfifc.h ospfd1.6/src/spfifc.h
+--- ospfd1.5/src/spfifc.h	Wed May 24 11:00:30 2000
++++ ospfd1.6/src/spfifc.h	Tue May 30 17:00:51 2000
+@@ -111,6 +111,7 @@
+     // Configurable parameters
+     InMask if_mask;	// Interface address mask
+     uns16 mtu;		// Max IP datagram in bytes
++    int if_type;	// Physical interface type
+     int	if_IfIndex;	// MIB-II IfIndex
+     uns16 if_cost;	// Cost
+     byte if_rxmt;	// Retransmission interval
+@@ -200,9 +201,10 @@
+     void dump_stats(struct IfcRsp *irsp);
+     bool mospf_enabled();
+     void reorig_all_grplsas();
++    int type();
++    void run_fsm(int event);// Interface Finite state machine
+ 
+     // Virtual functions
+-    virtual void run_fsm(int event);// Interface Finite state machine
+     virtual void clear_config();
+     virtual void if_send(Pkt *, InAddr);
+     virtual void nbr_send(Pkt *, SpfNbr *); // send OSPF packet to neighbor
+@@ -212,7 +214,6 @@
+     virtual int rl_size();
+     virtual void add_adj_to_cand(class PriQ &cand) = 0;
+     virtual int adjacency_wanted(class SpfNbr *np);
+-    virtual int type() = 0;
+     virtual void send_hello_response(SpfNbr *np);
+     virtual bool is_virtual();
+     virtual bool is_multi_access();
+@@ -308,7 +309,6 @@
+ class PPIfc : public SpfIfc {
+   public:
+     inline PPIfc(InAddr addr, int phyint);
+-    int type();
+     bool is_multi_access();
+     virtual void ifa_start();
+     virtual class SpfNbr *find_nbr(InAddr, rtid_t);
+@@ -322,6 +322,7 @@
+ 
+ inline PPIfc::PPIfc(InAddr addr, int phyint) : SpfIfc(addr, phyint)
+ {
++    if_type = IFT_PP;
+ }
+ 
+ /* A virtual link. These send a single copy of each multicast packet
+@@ -337,7 +338,6 @@
+   public:
+     VLIfc(SpfArea *, class RTRrte *);
+     ~VLIfc();
+-    virtual int type();
+     virtual SpfArea *transit_area();
+     virtual rtid_t *vl_endpt();
+     virtual bool is_virtual();
+@@ -375,12 +375,12 @@
+ class BroadcastIfc : public DRIfc {
+   public:
+     inline BroadcastIfc(InAddr addr, int phyint);
+-    virtual int type();
+ };
+ 
+ inline BroadcastIfc::BroadcastIfc(InAddr addr, int phyint)
+ : DRIfc(addr, phyint)
+ {
++    if_type = IFT_BROADCAST;
+ }
+ 
+ /* The NBMA interface, such full mesh-connected Frame relay subnets.
+@@ -391,7 +391,6 @@
+ class NBMAIfc : public DRIfc {
+   public:
+     inline NBMAIfc(InAddr addr, int phyint);
+-    virtual int type();
+     virtual void if_send(Pkt *pdesc, InAddr addr);
+     virtual void start_hellos();
+     virtual void restart_hellos();
+@@ -402,6 +401,7 @@
+ 
+ inline NBMAIfc::NBMAIfc(InAddr addr, int phyint) : DRIfc(addr, phyint)
+ {
++    if_type = IFT_NBMA;
+ }
+ 
+ /* The point-to-Multipoint interface, such as non-full-mesh connected
+@@ -413,7 +413,6 @@
+ class P2mPIfc : public SpfIfc {
+   public:
+     inline P2mPIfc(InAddr addr, int phyint);
+-    virtual int type();
+     virtual void if_send(Pkt *pdesc, InAddr addr);
+     virtual void start_hellos();
+     virtual void restart_hellos();
+@@ -427,6 +426,7 @@
+ 
+ inline P2mPIfc::P2mPIfc(InAddr addr, int phyint) : SpfIfc(addr, phyint)
+ {
++    if_type = IFT_P2MP;
+ }
+ 
+ /* The loopback interface. One allocated for each loopback
+@@ -439,9 +439,8 @@
+ class LoopIfc : public SpfIfc {
+   public:
+     LoopIfc(SpfArea *, InAddr net, InMask mask);
++    ~LoopIfc();
+     virtual void ifa_start();
+     virtual RtrLink *rl_insert(RTRhdr *, RtrLink *);
+     virtual void add_adj_to_cand(class PriQ &cand);
+-    virtual int type();
+-    virtual void run_fsm(int event);// Interface Finite state machine
+ };
+diff -abur --exclude-from=exclude_files ospfd1.5/src/spfvl.C ospfd1.6/src/spfvl.C
+--- ospfd1.5/src/spfvl.C	Wed May 24 11:00:30 2000
++++ ospfd1.6/src/spfvl.C	Tue May 30 17:00:51 2000
+@@ -91,6 +91,7 @@
+ {
+     SpfArea *bb;
+ 
++    if_type = IFT_VL;
+     if_tap = tap;	// Transit area
+     if_nbrid = endpt->rtrid();// Configured neighbor ID
+     if_rmtaddr = 0;	// IP address of other end (learned dynamically)

@@ -1,0 +1,181 @@
+diff -abur --exclude-from=exclude_files ospfd1.6/src/config.C ospfd1.7/src/config.C
+--- ospfd1.6/src/config.C	Tue May 30 17:00:51 2000
++++ ospfd1.7/src/config.C	Fri Jun  2 11:25:15 2000
+@@ -70,17 +70,22 @@
+  * Those configuration items that have not been
+  * updated are either deleted or returned to their
+  * default values.
++ * We have to be a little careful traversing the list
++ * of configured items because the removal of one
++ * item by ConfigItem::clear_config() may cause
++ * other items to get deleted further down the list.
+  */
+ 
+ void OSPF::cfgDone()
+ 
+ {
++    ConfigItem **prev;
+     ConfigItem *item;
+-    ConfigItem *next;
+ 
+-    for (item = cfglist; item; item = next) {
+-	next = item->next;
++    for (prev = &cfglist; (item = *prev); ) {
+ 	if (!item->updated)
+ 	    item->clear_config();
++	if (item == *prev)
++	    prev = &item->next;
+     }
+ }
+diff -abur --exclude-from=exclude_files ospfd1.6/src/spfifc.C ospfd1.7/src/spfifc.C
+--- ospfd1.6/src/spfifc.C	Tue May 30 17:00:51 2000
++++ ospfd1.7/src/spfifc.C	Fri Jun  2 11:25:15 2000
+@@ -214,6 +214,10 @@
+     area_flood = false;
+     global_flood = false;
+     if_demand_helapse = 0;
++    // Virtual link parameters
++    if_tap = 0;		// Transit area
++    if_nbrid = 0;	// Configured neighbor ID
++    if_rmtaddr = 0;	// IP address of other end
+ }
+ 
+ /* Destructor for an interface. Declare the interface down,
+@@ -289,26 +293,38 @@
+     return("Unknown");
+ }
+ 
+-/* Base functions that may be overriden for specific interface
+- * types.
+- */
++// Is the interface a virtual link?
+ 
+ bool SpfIfc::is_virtual()
+ {
+-    return(false);
++    return(if_type == IFT_VL);
+ }
++
++// Can the interface support more than one neighbor?
++
+ bool SpfIfc::is_multi_access()
+ {
+-    return(true);
++    return(if_type != IFT_PP && if_type != IFT_VL);
+ }
++
++// Return the transit area (0 if not a virtual link)
++
+ SpfArea *SpfIfc::transit_area()
+ {
+-    return(0);
++    return(if_tap);
+ }
++
++// Return the endpoint of a virtual link
++
+ rtid_t *SpfIfc::vl_endpt()
+ {
+-    return(0);
++    return(&if_nbrid);
+ }
++
++/* Base functions that may be overriden for specific interface
++ * types.
++ */
++
+ void SpfIfc::start_hellos()
+ {
+     send_hello();
+@@ -328,30 +344,8 @@
+     return(false);
+ }
+ 
+-/* Trivial virtual functions for point-to-point interfaces.
+- */
+-
+-bool PPIfc::is_multi_access()
+-{
+-    return(false);
+-}
+-
+ /* Trivial virtual functions for virtual links.
+  */
+-
+-SpfArea *VLIfc::transit_area()
+-{
+-    return(if_tap);
+-}
+-bool VLIfc::is_virtual()
+-{
+-    return(true);
+-}
+-
+-rtid_t *VLIfc::vl_endpt()
+-{
+-    return(&if_nbrid);
+-}
+ 
+ /* Trivial functions for interfaces which elect a Designated
+  * Router.
+diff -abur --exclude-from=exclude_files ospfd1.6/src/spfifc.h ospfd1.7/src/spfifc.h
+--- ospfd1.6/src/spfifc.h	Tue May 30 17:00:51 2000
++++ ospfd1.7/src/spfifc.h	Fri Jun  2 11:25:15 2000
+@@ -157,6 +157,11 @@
+     void ifa_reset();
+     void ifa_allnbrs_event(int event);
+ 
++    // Virtual link parameters
++    SpfArea *if_tap;	// Transit area
++    rtid_t if_nbrid;	// Configured neighbor ID
++    InAddr if_rmtaddr;	// IP address of other end
++
+   public:
+     // Configurable parameters
+     InAddr if_addr;	// Interface IP address
+@@ -203,6 +208,10 @@
+     void reorig_all_grplsas();
+     int type();
+     void run_fsm(int event);// Interface Finite state machine
++    bool is_virtual();
++    bool is_multi_access();
++    SpfArea *transit_area();
++    rtid_t *vl_endpt();
+ 
+     // Virtual functions
+     virtual void clear_config();
+@@ -215,10 +224,6 @@
+     virtual void add_adj_to_cand(class PriQ &cand) = 0;
+     virtual int adjacency_wanted(class SpfNbr *np);
+     virtual void send_hello_response(SpfNbr *np);
+-    virtual bool is_virtual();
+-    virtual bool is_multi_access();
+-    virtual SpfArea *transit_area();
+-    virtual rtid_t *vl_endpt();
+     virtual void start_hellos();
+     virtual void restart_hellos();
+     virtual void stop_hellos();
+@@ -309,7 +314,6 @@
+ class PPIfc : public SpfIfc {
+   public:
+     inline PPIfc(InAddr addr, int phyint);
+-    bool is_multi_access();
+     virtual void ifa_start();
+     virtual class SpfNbr *find_nbr(InAddr, rtid_t);
+     virtual void set_id_or_addr(SpfNbr *, rtid_t, InAddr);
+@@ -332,15 +336,9 @@
+  */
+ 
+ class VLIfc : public PPIfc {
+-    SpfArea *if_tap;	// Transit area
+-    rtid_t if_nbrid;	// Configured neighbor ID
+-    InAddr if_rmtaddr;	// IP address of other end
+   public:
+     VLIfc(SpfArea *, class RTRrte *);
+     ~VLIfc();
+-    virtual SpfArea *transit_area();
+-    virtual rtid_t *vl_endpt();
+-    virtual bool is_virtual();
+     virtual void ifa_start();
+     virtual void if_send(Pkt *, InAddr);
+     virtual void nbr_send(Pkt *, SpfNbr *);

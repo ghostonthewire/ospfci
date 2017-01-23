@@ -1,0 +1,46 @@
+diff -X exclude_files -Nabur ospfd1.17/ospf_sim/ospfd_sim.C ospfd1.18/ospf_sim/ospfd_sim.C
+--- ospfd1.17/ospf_sim/ospfd_sim.C	Sun Dec 19 21:04:25 1999
++++ ospfd1.18/ospf_sim/ospfd_sim.C	Tue Dec  5 14:34:57 2000
+@@ -210,9 +210,8 @@
+ 	    }
+ 	    else {
+ 	        InAddr gw;
+-		SpfIfc *ip;
+ 		gw = mpp->NHs[0].gw;
+-		if (gw != 0 && (ip = mpp->NHs[0].o_ifp) && ip->unnumbered())
++		if (gw != 0 && mpp->NHs[0].if_addr == 0)
+ 		    gw = (InAddr) -1;
+ 	        sendpkt(pkt, mpp->NHs[0].phyint, gw);
+ 	    }
+diff -X exclude_files -Nabur ospfd1.17/ospf_sim/sim_system.C ospfd1.18/ospf_sim/sim_system.C
+--- ospfd1.17/ospf_sim/sim_system.C	Wed Dec  8 15:52:05 1999
++++ ospfd1.18/ospf_sim/sim_system.C	Tue Dec  5 14:34:57 2000
+@@ -102,7 +102,6 @@
+ {
+     MPath *mpp;
+     InAddr gw;
+-    SpfIfc *ip;
+ 
+     // Resolve next hop
+     if (!ipforwarding)
+@@ -118,7 +117,7 @@
+ 	return;
+     }
+     gw = mpp->NHs[0].gw;
+-    if (gw != 0 && (ip = mpp->NHs[0].o_ifp) && ip->unnumbered())
++    if (gw != 0 && mpp->NHs[0].if_addr == 0)
+         gw = (InAddr) -1;
+     sendpkt(pkt, mpp->NHs[0].phyint, gw);
+ }
+diff -X exclude_files -Nabur ospfd1.17/src/ospf.h ospfd1.18/src/ospf.h
+--- ospfd1.17/src/ospf.h	Tue Dec  5 14:30:53 2000
++++ ospfd1.18/src/ospf.h	Tue Dec  5 14:34:56 2000
+@@ -260,7 +260,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 17,	// Minor version number
++	vminor = 18,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code

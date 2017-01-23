@@ -1,0 +1,190 @@
+diff -X exclude_files -Nabur ospfd1.23/linux/ospfd_linux.C ospfd1.24/linux/ospfd_linux.C
+--- ospfd1.23/linux/ospfd_linux.C	Fri Jan 19 15:20:44 2001
++++ ospfd1.24/linux/ospfd_linux.C	Thu Jan 25 15:44:23 2001
+@@ -761,10 +761,47 @@
+     else {
+ 	byte ifname[IFNAMSIZ];
+ 	memset(ifname, 0, IFNAMSIZ);
+-	memcpy(ifname, arg, IFNAMSIZ);
++	strncpy((char *)ifname, arg, IFNAMSIZ);
+ 	phyp = (BSDPhyInt *) phyints.find(ifname, IFNAMSIZ);
++#if LINUX_VERSION_CODE >= LINUX22
++	// Try to detect unnumbered interfaces
++	if (!phyp) {
++	    int ifindex;
++	    byte *phystr;
++	    ifreq ifr;
++	    short ifflags;
++	    memcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
++	    if (memchr(ifr.ifr_name, ':', sizeof(ifr.ifr_name)))
++	        goto done;
++	    if (ioctl(udpfd, SIOCGIFFLAGS, (char *)&ifr) < 0)
++	        goto done;
++	    if ((ifr.ifr_flags & IFF_LOOPBACK) != 0)
++	        goto done;
++	    ifflags = ifr.ifr_flags;
++	    // Get interface index
++	    if (ioctl(udpfd, SIOCGIFINDEX, (char *)&ifr) < 0)
++	        goto done;
++	    ifindex = ifr.ifr_ifindex;
++	    if (phys[ifindex])
++	        goto done;
++	    phyp = new BSDPhyInt;
++	    phystr = new byte[sizeof(ifr.ifr_name)];
++	    memcpy(phystr, ifr.ifr_name, sizeof(ifr.ifr_name));
++	    phyp->key = phystr;
++	    phyp->keylen = sizeof(ifr.ifr_name);
++	    phyp->phyint = ifindex;
++	    phyp->flags = 0;
++	    phyints.add(phyp);
++	    phys[phyp->phyint] = phyp;
++	    set_flags(phyp, ifflags);
++	    phyp->addr = 0;
++	    phyp->mask = 0;
++	    phyp->dstaddr = 0;
++	}
++#endif
+     }
+ 
++  done:
+     if (!phyp) {
+ 	syslog(LOG_ERR, "Bad interface identifier %s", arg);
+ 	return(false);
+@@ -880,26 +917,6 @@
+ 
+     if (!ospfd_sys->parse_interface(argv[1], addr, phyp))
+ 	return(TCL_OK);
+-
+-    if (inet_aton(argv[1], &addr) == 1) {
+-	BSDIfMap *map;
+-	InAddr ifaddr;
+-	ifaddr = ntoh32(addr.s_addr);
+-	map = (BSDIfMap *)ospfd_sys->interface_map.find(ifaddr, 0);
+-	if (map != 0)
+-	    phyp = map->phyp;
+-    }
+-    else {
+-	byte ifname[IFNAMSIZ];
+-	memset(ifname, 0, IFNAMSIZ);
+-	memcpy(ifname, argv[1], IFNAMSIZ);
+-	phyp = (BSDPhyInt *) ospfd_sys->phyints.find(ifname, IFNAMSIZ);
+-    }
+-
+-    if (!phyp) {
+-	syslog(LOG_ERR, "Bad interface identifier %s", argv[1]);
+-	return(TCL_OK);
+-    }
+ 
+     m.address = phyp->addr;
+     m.phyint = phyp->phyint;
+diff -X exclude_files -Nabur ospfd1.23/linux/system.C ospfd1.24/linux/system.C
+--- ospfd1.23/linux/system.C	Fri Jan 19 15:20:44 2001
++++ ospfd1.24/linux/system.C	Thu Jan 25 15:44:23 2001
+@@ -67,19 +67,27 @@
+     sockaddr_in to;
+ 
+     phyp = phys[phyint];
++#if LINUX_VERSION_CODE < LINUX22
+     if (phyp->flags & IFF_POINTOPOINT)
+ 	pkt->i_dest = hton32(phyp->dstaddr);
+-    else if (gw != 0)
++    else
++#endif
++    if (gw != 0)
+ 	pkt->i_dest = hton32(gw);
+     pkt->i_chksum = ~incksum((uns16 *)pkt, sizeof(pkt));
+ 
+     if (IN_CLASSD(ntoh32(pkt->i_dest))) {
+-	in_addr mcaddr;
+-	mcaddr.s_addr = hton32(phyp->addr);
++#if LINUX_VERSION_CODE < LINUX22
++	in_addr mreq;
++	mreq.s_addr = hton32(phyp->addr);
++#else
++	ip_mreqn mreq;
++	mreq.imr_ifindex = phyint;
++	mreq.imr_address.s_addr = 0;
++#endif
+ 	if (setsockopt(netfd, IPPROTO_IP, IP_MULTICAST_IF,
+-		       (char *)&mcaddr, sizeof(mcaddr)) < 0) {
+-	    syslog(LOG_ERR, "IP_MULTICAST_IF %s: %m",
+-		   inet_ntoa(mcaddr));
++		       (char *)&mreq, sizeof(mreq)) < 0) {
++	    syslog(LOG_ERR, "IP_MULTICAST_IF phyint %d: %m", phyint);
+ 	    return;
+ 	}
+     }
+@@ -176,19 +184,27 @@
+ void LinuxOspfd::join(InAddr group, int phyint)
+ 
+ {
++#if LINUX_VERSION_CODE < LINUX22
+     ip_mreq mreq;
++#else
++    ip_mreqn mreq;
++#endif
+     BSDPhyInt *phyp;
+ 
+     phyp = phys[phyint];
+-    if ((phyp->flags & IFF_BROADCAST) == 0)
++    if ((phyp->flags & IFF_MULTICAST) == 0)
+ 	return;
+     mreq.imr_multiaddr.s_addr = hton32(group);
++#if LINUX_VERSION_CODE < LINUX22
+     mreq.imr_interface.s_addr = hton32(phyp->addr);
++#else
++    mreq.imr_ifindex = phyint;
++    mreq.imr_address.s_addr = 0;
++#endif
+ 
+     if (setsockopt(netfd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+ 		   (char *)&mreq, sizeof(mreq)) < 0)
+-	syslog(LOG_ERR, "Join error, ifc %s: %m",
+-	       inet_ntoa(mreq.imr_interface));
++	syslog(LOG_ERR, "Join error, phyint %d: %m", phyint);
+ }
+ 
+ /* Leave a particular multicast group, again on a given
+@@ -198,19 +214,27 @@
+ void LinuxOspfd::leave(InAddr group, int phyint)
+ 
+ {
++#if LINUX_VERSION_CODE < LINUX22
+     ip_mreq mreq;
++#else
++    ip_mreqn mreq;
++#endif
+     BSDPhyInt *phyp;
+ 
+     phyp = phys[phyint];
+-    if ((phyp->flags & IFF_BROADCAST) == 0)
++    if ((phyp->flags & IFF_MULTICAST) == 0)
+ 	return;
+     mreq.imr_multiaddr.s_addr = hton32(group);
++#if LINUX_VERSION_CODE < LINUX22
+     mreq.imr_interface.s_addr = hton32(phyp->addr);
++#else
++    mreq.imr_ifindex = phyint;
++    mreq.imr_address.s_addr = 0;
++#endif
+ 
+     if (setsockopt(netfd, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+ 		   (char *)&mreq, sizeof(mreq)) < 0)
+-	syslog(LOG_ERR, "Leave error, ifc %s: %m",
+-	       inet_ntoa(mreq.imr_interface));
++	syslog(LOG_ERR, "Leave error, phyint %d: %m", phyint);
+ }
+ 
+ /* Enable or disable IP forwarding.
+diff -X exclude_files -Nabur ospfd1.23/src/ospf.h ospfd1.24/src/ospf.h
+--- ospfd1.23/src/ospf.h	Fri Jan 19 15:20:44 2001
++++ ospfd1.24/src/ospf.h	Thu Jan 25 15:44:22 2001
+@@ -265,7 +265,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 23,	// Minor version number
++	vminor = 24,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code

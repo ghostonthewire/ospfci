@@ -1,0 +1,462 @@
+diff -X exclude_files -Nabur ospfd1.26/src/nbrfsm.C ospfd1.27/src/nbrfsm.C
+--- ospfd1.26/src/nbrfsm.C	Wed Feb 14 15:35:14 2001
++++ ospfd1.27/src/nbrfsm.C	Wed Feb 28 12:51:09 2001
+@@ -224,6 +224,7 @@
+ 
+     // Maintain count of adjacencies that we are
+     // currently attempting
++    ap->adj_change(this, n_ostate);
+     tap = n_ifp->transit_area();
+     // now Full
+     if (n_state == NBS_FULL) {
+@@ -241,7 +242,6 @@
+ 	ospf->n_dbx_nbrs++;
+     // Never go from Full state immed back into dbxchng
+     else if (n_ostate == NBS_FULL) {
+-        (void) n_ifp->more_adjacencies_needed(id(), true);
+ 	if (n_ifp->if_nfull-- == 1)
+ 	    n_ifp->reorig_all_grplsas();
+ 	if (tap && tap->n_VLs-- == 1)
+@@ -249,7 +249,6 @@
+ 	ap->rl_orig();
+     }
+     else if (n_state <= NBS_2WAY && n_ostate >= NBS_EXST) {
+-        (void) n_ifp->more_adjacencies_needed(id(), true);
+ 	exit_dbxchg();
+ 	if (n_ostate > NBS_EXST)
+ 	    ospf->n_dbx_nbrs--;
+@@ -259,17 +258,11 @@
+     if (n_ifp->state() == IFS_DR)
+ 	n_ifp->nl_orig(false);
+ 
+-    /* If necessary, run Interface state machine with event
+-     * NeighborChange
+-     * Also, schedule routing calculation if we are
+-     * limiting point-to-point adjacencies
+-     */
++    // If necessary, run Interface state machine with event
++    // NeighborChange
+     if ((n_state >= NBS_2WAY && n_ostate < NBS_2WAY) ||
+-	(n_state < NBS_2WAY && n_ostate >= NBS_2WAY)) {
++	(n_state < NBS_2WAY && n_ostate >= NBS_2WAY))
+ 	n_ifp->run_fsm(IFE_NCHG);
+-	if (ospf->PPAdjLimit != 0 && n_ifp->type() == IFT_PP)
+-	    ospf->full_sched = true;
+-    }
+ }
+ 
+ 
+@@ -286,7 +279,7 @@
+     n_state = NBS_2WAY;
+     if (!n_ifp->adjacency_wanted(this))
+ 	DelPendAdj();
+-    else if (!n_ifp->more_adjacencies_needed(id(), false))
++    else if (!n_ifp->more_adjacencies_needed(id()))
+ 	DelPendAdj();
+     else if (ospf->n_lcl_inits < ospf->max_dds) {
+ 	n_state = NBS_EXST;
+diff -X exclude_files -Nabur ospfd1.26/src/ospf.h ospfd1.27/src/ospf.h
+--- ospfd1.26/src/ospf.h	Wed Feb 14 15:35:14 2001
++++ ospfd1.27/src/ospf.h	Wed Feb 28 12:51:09 2001
+@@ -265,7 +265,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 26,	// Minor version number
++	vminor = 27,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -X exclude_files -Nabur ospfd1.26/src/rtrlsa.C ospfd1.27/src/rtrlsa.C
+--- ospfd1.26/src/rtrlsa.C	Wed Feb 14 15:35:14 2001
++++ ospfd1.27/src/rtrlsa.C	Wed Feb 28 12:51:09 2001
+@@ -110,15 +110,27 @@
+     SpfNbr *np;
+ 
+     if ((np = if_nlst) && np->state() == NBS_FULL) {
++	PPAdjAggr *adjaggr;
++	uns16 adv_cost;
++	adv_cost = if_cost;
++	adjaggr = (PPAdjAggr *)if_area->AdjAggr.find(np->id(), 0);
++	if (adjaggr && adjaggr->first_full) {
++	    if (adjaggr->first_full != this)
++	        goto adv_stub;
++	    adv_cost = adjaggr->nbr_cost;
++	}
+ 	rlp->link_id = hton32(np->id());
+ 	rlp->link_data = hton32(unnumbered() ? if_IfIndex : if_addr);
+ 	rlp->link_type = LT_PP;
+ 	rlp->n_tos = 0;
+-	rlp->metric = hton16(if_cost);
++	rlp->metric = hton16(adv_cost);
+ 	if_area->add_to_ifmap(this);
+ 	rlp++;
+ 	rtrhdr->nlinks++;
+     }
++
++  adv_stub: // Advertise stub link to neighbor's IP address
++
+     if (state() == IFS_PP && !unnumbered() && np) {
+ 	rlp->link_id = hton32(np->addr());
+ 	rlp->link_data = hton32(0xffffffffL);
+diff -X exclude_files -Nabur ospfd1.26/src/spfarea.C ospfd1.27/src/spfarea.C
+--- ospfd1.26/src/spfarea.C	Wed Feb 14 15:35:14 2001
++++ ospfd1.27/src/spfarea.C	Wed Feb 28 12:51:09 2001
+@@ -25,6 +25,7 @@
+ #include "ospfinc.h"
+ #include "ifcfsm.h"
+ #include "system.h"
++#include "nbrfsm.h"
+ 
+ /* Constructor for an OSPF area.
+  */
+@@ -620,3 +621,127 @@
+ 	    sl_orig(range->r_rte);
+     }
+ }
++
++/* Initialize the aggregate adjacency information to a given
++ * neighbor.
++ */
++
++PPAdjAggr::PPAdjAggr(rtid_t n_id) : AVLitem(n_id, 0)
++
++{
++    nbr_cost = 0;
++    first_full = 0;
++    nbr_mpath = 0;
++    n_adjs = 0;
++}
++
++/* The state of one of the conversations with a neighbor
++ * has changed. If this is a point-to-point link, and we
++ * are limiting the number of adjacencies, we may now have
++ * to take one ore more of the following actions:
++ * a) attempt to establish additional adjacencies
++ * b) re-originate our router-LSA
++ * c) rerun our routing calculation.
++ *
++ * If OSPF::PPAdjLimit is non-zero, we limit the number
++ * of point-to-point links which will become adjacent
++ * to a particular neighbor. If the "enlist" parameter
++ * is true, and there are insufficient adjacencies, we
++ * add all the 2-Way point-to-point interfaces to the
++ * pending adjacency list, since we don't know which
++ * ones we will be able to advance.
++ */
++
++
++void SpfArea::adj_change(SpfNbr *xnp, int n_ostate)
++
++{
++    bool more_needed;
++    PPAdjAggr *adjaggr;
++    IfcIterator iter(this);
++    SpfIfc *ip;
++    rtid_t n_id=xnp->id();
++    int n_state=xnp->state();
++    bool rescan=false;
++    uns16 old_cost;
++    SpfIfc *old_first;
++    MPath *old_mpath;
++
++    if (xnp->ifc()->type() != IFT_PP)
++        return;
++    if (ospf->PPAdjLimit == 0)
++        return;
++    // If necessary, allocate adjacency bookkeeping class
++    if (!(adjaggr = (PPAdjAggr *)AdjAggr.find(n_id, 0))) {
++        adjaggr = new PPAdjAggr(n_id);
++	AdjAggr.add(adjaggr);
++    }
++    /* Update number of current adjacencies, and determine
++     * whether a complete rescan is necessary.
++     */
++    if (n_state <= NBS_2WAY && n_ostate >= NBS_EXST)
++        adjaggr->n_adjs--;
++    else if (n_ostate <= NBS_2WAY && n_state >= NBS_EXST)
++        adjaggr->n_adjs++;
++    if ((n_state >= NBS_2WAY && n_ostate < NBS_2WAY) ||
++	(n_state < NBS_2WAY && n_ostate >= NBS_2WAY) ||
++	(n_ostate == NBS_FULL || n_state == NBS_FULL))
++        rescan = true;
++
++    // End with higher router ID will decide
++    more_needed = (ospf->my_id() >n_id) && (adjaggr->n_adjs< ospf->PPAdjLimit);
++    // Rescan only on relevant changes
++    if (!rescan && !more_needed)
++        return;
++    // Remember old parameters
++    old_cost = adjaggr->nbr_cost;
++    old_first = adjaggr->first_full;
++    old_mpath = adjaggr->nbr_mpath;
++    // Reset parameters before scan
++    adjaggr->nbr_cost = 0;
++    adjaggr->first_full = 0;
++    adjaggr->nbr_mpath = 0;
++    /* Find first adjacency, best bidirectional
++     * link cost, and calculate the multipath entry
++     * of those interfaces having the best cost.
++     * Also, modify list of pending adjacencies depending
++     * upon whether more are needed.
++     */
++    while ((ip = iter.get_next())) {
++        SpfNbr *np;
++        if (ip->type() != IFT_PP)
++	    continue;
++	if (!(np = ip->if_nlst))
++	    continue;
++	// To this same neighbor?
++	if (np->id() != n_id)
++	    continue;
++	if (np->state() == NBS_FULL && adjaggr->first_full == 0)
++	    adjaggr->first_full = ip;
++	if (np->state() == NBS_2WAY) {
++	    if (!more_needed)
++	        np->DelPendAdj();
++	    else
++	        np->AddPendAdj();
++	}
++	if (np->state() >= NBS_2WAY) {
++	    if (adjaggr->nbr_cost == 0 || adjaggr->nbr_cost > ip->cost()) {
++	        adjaggr->nbr_cost = ip->cost();
++		adjaggr->nbr_mpath = 0;
++	    }
++	    if (adjaggr->nbr_cost == ip->cost()) {
++		MPath *add_nh;
++		add_nh = MPath::create(ip, np->addr());
++		adjaggr->nbr_mpath = MPath::merge(adjaggr->nbr_mpath, add_nh);
++	    }
++	}
++    }
++    // Need to re-originate router-LSA?
++    if (adjaggr->nbr_cost != old_cost || adjaggr->first_full != old_first)
++        rl_orig();
++    // Need to rerun routing calculation?
++    if (adjaggr->nbr_mpath != old_mpath)
++        ospf->full_sched = true;
++}
++
++
+diff -X exclude_files -Nabur ospfd1.26/src/spfarea.h ospfd1.27/src/spfarea.h
+--- ospfd1.26/src/spfarea.h	Wed Feb 14 15:35:14 2001
++++ ospfd1.27/src/spfarea.h	Wed Feb 28 12:51:09 2001
+@@ -57,6 +57,7 @@
+     int mospf_in_count; // Number of same;
+ 
+     AVLtree abr_tbl;	// RTRrte's for area border routers
++    AVLtree AdjAggr;	// Aggregate adjacency information
+ 
+   public:
+     bool a_stub; 	// Options supported by area
+@@ -107,6 +108,7 @@
+     void add_to_ifmap(SpfIfc *ip);
+     void delete_from_ifmap(SpfIfc *ip);
+     InAddr id_to_addr(rtid_t id);
++    void adj_change(SpfNbr *, int n_ostate);
+ 
+     // MOSPF routines
+     void mospf_path_calc(InAddr, INrte *, int &, uns32 &, LsaList *);
+@@ -121,6 +123,7 @@
+     friend class IfcIterator;
+     friend class AreaIterator;
+     friend class SpfIfc;
++    friend class PPIfc;
+     friend class DRIfc;
+     friend class VLIfc;
+     friend class SpfNbr;
+@@ -198,3 +201,35 @@
+ 
+     friend class SpfArea;
+ };
++
++/* Data structure which collects all the information
++ * regarding point-to-point adjacencies to a particular node through
++ * this area. This is used to limit the number of
++ * point-to-point adjacencies, while still preserving
++ * forwarding semantics.
++ * Organized in SpfArea:AdjAggr by neighbor Router ID.
++ * - PPAdjAggr::nbr_cost is the smallest cost of any of the
++ * bidirectional links to the neighbor.
++ * - PPAdjAggr::first_full is one of the full adjacencies to the
++ * neighbor, and is used to trigger inclusion of the point-to-point
++ * link in the router-LSA.
++ * - PPAdjAggr::nbr_mpath is the collection of all the least cost
++ * bidirectional links to the neighbor, pre-calculated for use by
++ * the routing calculation.
++ * - PPAdjAggr::n_adjs is the number of neighbor relationships in state
++ * exstart or greater. This is limited by OSPF::PPAdjLimit.
++ */
++
++class PPAdjAggr : public AVLitem {
++    uns16 nbr_cost;	// Best cost to neighbor
++    SpfIfc *first_full;
++    MPath *nbr_mpath;
++    uns32 n_adjs;
++  public:
++    PPAdjAggr(rtid_t n_id);
++    friend class SpfArea;
++    friend class SpfIfc;
++    friend class SpfNbr;
++    friend class PPIfc;
++};
++
+diff -X exclude_files -Nabur ospfd1.26/src/spfcalc.C ospfd1.27/src/spfcalc.C
+--- ospfd1.26/src/spfcalc.C	Wed Feb 14 15:35:14 2001
++++ ospfd1.27/src/spfcalc.C	Wed Feb 28 12:51:09 2001
+@@ -886,31 +886,14 @@
+ 
+ {
+     rtid_t nbr_id;
+-    IfcIterator iter(if_area);
+-    SpfIfc *ip;
++    PPAdjAggr *adjaggr;
+ 
+     nbr_id = dst->ls_id();
+     if (ospf->PPAdjLimit == 0)
+         return(new_nh);
+-    while ((ip = iter.get_next())) {
+-        SpfNbr *np;
+-	if (ip == this)
+-	    continue;
+-        if (ip->type() != IFT_PP)
+-	    continue;
+-	if (!(np = ip->if_nlst))
+-	    continue;
+-	// To this same neighbor?
+-	if (np->id() != nbr_id)
+-	    continue;
+-	if (np->n_state == NBS_2WAY) {
+-	    InAddr t_gw;
+-	    MPath *add_nh;
+-	    t_gw = dst->ospf_find_gw(if_area->mylsa, ip->net(), ip->mask());
+-	    add_nh = MPath::create(ip, t_gw);
+-	    new_nh = MPath::merge(new_nh, add_nh);
+-	}
+-    }
+-
++    else if (!(adjaggr = (PPAdjAggr *)if_area->AdjAggr.find(nbr_id, 0)))
++        return(new_nh);
++    else if (!adjaggr->nbr_mpath)
+     return(new_nh);
++    return (adjaggr->nbr_mpath);
+ }
+diff -X exclude_files -Nabur ospfd1.26/src/spfhello.C ospfd1.27/src/spfhello.C
+--- ospfd1.26/src/spfhello.C	Wed Feb 14 15:35:14 2001
++++ ospfd1.27/src/spfhello.C	Wed Feb 28 12:51:10 2001
+@@ -188,7 +188,7 @@
+ 	hlopkt->hlo_opts |= SPO_DC;
+     hlopkt->hlo_pri = ospf->host_mode ? 0: if_drpri;
+     hlopkt->hlo_dint = hton32(if_dint);
+-    hlopkt->hlo_dr = hton32(if_dr);
++    hlopkt->hlo_dr = ((type() != IFT_PP) ? hton32(if_dr) : hton32(mtu));
+     hlopkt->hlo_bdr = hton32(if_bdr);
+     // Advance data pointer
+     pkt->dptr = (byte *) (hlopkt + 1);
+@@ -236,6 +236,15 @@
+ 	return;
+     if (if_area->a_stub != ((hlopkt->hlo_opts & SPO_EXT) == 0))
+ 	return;
++    if (ospf->PPAdjLimit != 0 &&
++	type() == IFT_PP && ntoh32(hlopkt->hlo_dr) > mtu) {
++        if (ospf->spflog(LOG_BADMTU, 5)) {
++	    ospf->log(this);
++	    ospf->log("remote mtu ");
++	    ospf->log(ntoh32(hlopkt->hlo_dr));
++	}
++	return;
++    }
+ 
+     // Find the neighbor structure
+     // If one is not found, it is created
+diff -X exclude_files -Nabur ospfd1.26/src/spfifc.C ospfd1.27/src/spfifc.C
+--- ospfd1.26/src/spfifc.C	Wed Feb 14 15:35:14 2001
++++ ospfd1.27/src/spfifc.C	Wed Feb 28 12:51:10 2001
+@@ -1053,50 +1053,26 @@
+  * ones we will be able to advance.
+  */
+ 
+-bool SpfIfc::more_adjacencies_needed(rtid_t, bool enlist)
++bool SpfIfc::more_adjacencies_needed(rtid_t)
+ 
+ {
+     return(true);
+ }
+ 
+-bool VLIfc::more_adjacencies_needed(rtid_t, bool enlist)
++bool VLIfc::more_adjacencies_needed(rtid_t)
+ 
+ {
+     return(true);
+ }
+ 
+-bool PPIfc::more_adjacencies_needed(rtid_t nbr_id, bool enlist)
++bool PPIfc::more_adjacencies_needed(rtid_t nbr_id)
+ 
+ {
+-    IfcIterator iter(if_area);
+-    int n_adj;
+-    bool more_needed=true;
+-    SpfIfc *ip;
++    PPAdjAggr *adjaggr;
+ 
+     if (ospf->PPAdjLimit == 0)
+         return(true);
+-    // End with higher router ID will decide
+-    if (nbr_id  > ospf->my_id())
+-        return(false);
+-    for (n_adj = 0; more_needed && (ip = iter.get_next()); ) {
+-        SpfNbr *np;
+-        if (ip->type() != IFT_PP)
+-	    continue;
+-	if (!(np = ip->if_nlst))
+-	    continue;
+-	// To this same neighbor?
+-	if (np->id() != nbr_id)
+-	    continue;
+-	if (np->n_state >= NBS_EXST) {
+-	    n_adj++;
+-	    more_needed = (n_adj < (int) ospf->PPAdjLimit);
+-	}
+-	else if (np->n_state == NBS_2WAY) {
+-	    if (!more_needed)
+-	        np->DelPendAdj();
+-	    else if (enlist)
+-	        np->AddPendAdj();
+-	}
+-    }
+-    return(more_needed);
++    if (!(adjaggr = (PPAdjAggr *)if_area->AdjAggr.find(nbr_id, 0)))
++        return(true);
++    return ((ospf->my_id() >nbr_id) && (adjaggr->n_adjs< ospf->PPAdjLimit));
+ }
+diff -X exclude_files -Nabur ospfd1.26/src/spfifc.h ospfd1.27/src/spfifc.h
+--- ospfd1.26/src/spfifc.h	Wed Feb 14 15:35:14 2001
++++ ospfd1.27/src/spfifc.h	Wed Feb 28 12:51:10 2001
+@@ -228,7 +228,7 @@
+     virtual void restart_hellos();
+     virtual void stop_hellos();
+     virtual bool elects_dr();
+-    virtual bool more_adjacencies_needed(rtid_t, bool enlist);
++    virtual bool more_adjacencies_needed(rtid_t);
+     virtual MPath *add_parallel_links(MPath *, TNode *);
+ 
+     friend class PhyInt;
+@@ -324,7 +324,7 @@
+     virtual RtrLink *rl_insert(RTRhdr *, RtrLink *);
+     virtual int rl_size();
+     virtual void add_adj_to_cand(class PriQ &cand);
+-    virtual bool more_adjacencies_needed(rtid_t, bool enlist);
++    virtual bool more_adjacencies_needed(rtid_t);
+     virtual MPath *add_parallel_links(MPath *, TNode *);
+ };
+ 
+@@ -349,7 +349,7 @@
+     virtual RtrLink *rl_insert(RTRhdr *, RtrLink *);
+     void update(class RTRrte *endpt);
+     friend class OSPF;
+-    virtual bool more_adjacencies_needed(rtid_t, bool enlist);
++    virtual bool more_adjacencies_needed(rtid_t);
+     virtual MPath *add_parallel_links(MPath *, TNode *);
+ };
+ 

@@ -1,0 +1,231 @@
+diff -abur --exclude-from=exclude_files ospfd1.2/src/mospf.C ospfd1.3/src/mospf.C
+--- ospfd1.2/src/mospf.C	Tue May  2 14:57:09 2000
++++ ospfd1.3/src/mospf.C	Tue May  9 18:18:13 2000
+@@ -232,7 +232,8 @@
+         SpfIfc *o_ifp;
+ 	l_iter->remove_current();
+ 	V->in_mospf_cache = false;
+-	o_ifp = V->t_mpath->NHs[0].o_ifp;
++	o_ifp = ospf->find_ifc(V->t_mpath->NHs[0].if_addr,
++			       V->t_mpath->NHs[0].phyint);
+ 	ce->down_str[i].phyint = o_ifp->if_phyint;
+ 	ce->down_str[i].ttl = V->closest_member;
+ 	if (V->lsa_type == LST_NET || o_ifp->type() == IFT_PP)
+diff -abur --exclude-from=exclude_files ospfd1.2/src/ospf.C ospfd1.3/src/ospf.C
+--- ospfd1.2/src/ospf.C	Tue May  9 13:54:32 2000
++++ ospfd1.3/src/ospf.C	Tue May  9 18:10:19 2000
+@@ -615,7 +615,7 @@
+     SpfIfc *ip = 0;
+ 
+     if ((rte = inrttbl->best_match(dest)) &&
+-	(ip = rte->r_mpath->NHs[0].o_ifp) &&
++	(ip = rte->ifc()) &&
+ 	(!ip->unnumbered()))
+         return(ip->if_addr);
+ 
+diff -abur --exclude-from=exclude_files ospfd1.2/src/ospf.h ospfd1.3/src/ospf.h
+--- ospfd1.2/src/ospf.h	Tue May  9 13:54:05 2000
++++ ospfd1.3/src/ospf.h	Tue May  9 18:21:15 2000
+@@ -258,7 +258,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 2,	// Minor version number
++	vminor = 3,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+@@ -327,6 +327,7 @@
+     friend class GroupTimeoutTimer;
+     friend class LeaveQueryTimer;
+     friend class FWDtbl;
++    friend class MPath;
+     friend void lsa_flush(class LSA *);
+     friend void ExRtData::clear_config();
+     friend SpfNbr *GetNextAdj();
+diff -abur --exclude-from=exclude_files ospfd1.2/src/rte.C ospfd1.3/src/rte.C
+--- ospfd1.2/src/rte.C	Tue May  2 14:57:09 2000
++++ ospfd1.3/src/rte.C	Tue May  9 18:20:00 2000
+@@ -54,7 +54,7 @@
+ 
+     if (ip->is_virtual())
+ 	return(0);
+-    paths[0].o_ifp = ip;
++    paths[0].if_addr = ip->if_addr;
+     paths[0].phyint = ip->if_phyint;
+     paths[0].gw = addr;
+     return(create(1, paths));
+@@ -74,7 +74,7 @@
+ {
+     NH paths[MAXPATH];
+ 
+-    paths[0].o_ifp = 0;
++    paths[0].if_addr = (InAddr) -1;
+     paths[0].phyint = phyint;
+     paths[0].gw = addr;
+     return(create(1, paths));
+@@ -105,9 +105,9 @@
+     j = 0;
+     for (; i < mp1->npaths && n_paths < MAXPATH; i++) {
+ 	for (; j < mp2->npaths && n_paths < MAXPATH; j++) {
+-	    if (mp1->NHs[i].o_ifp < mp2->NHs[j].o_ifp)
++	    if (mp1->NHs[i].if_addr < mp2->NHs[j].if_addr)
+ 		break;
+-	    else if (mp1->NHs[i].o_ifp > mp2->NHs[j].o_ifp)
++	    else if (mp1->NHs[i].if_addr > mp2->NHs[j].if_addr)
+ 		paths[n_paths++] = mp2->NHs[j];
+ 	    else if (mp1->NHs[i].phyint < mp2->NHs[j].phyint)
+ 		break;
+@@ -145,7 +145,7 @@
+     for (i = 0, j = 0; i < mp->npaths; i++, j++) {
+ 	SpfIfc *ip;
+ 	paths[j] = mp->NHs[i];
+-	if (!(ip = paths[j].o_ifp))
++	if (!(ip = ospf->find_ifc(paths[j].if_addr, paths[j].phyint)))
+ 	    continue;
+ 	else if (ip->net() == 0 || (ip->mask() & gw) != ip->net())
+ 	    continue;
+@@ -155,12 +155,12 @@
+ 	}
+ 	else if (n_paths == MAXPATH ||
+ 		 paths[j].gw == gw ||
+-		 (mp->NHs[i+1].o_ifp == ip && paths[j].gw < gw))
++		 (mp->NHs[i+1].if_addr==paths[j].if_addr && paths[j].gw < gw))
+ 	    continue;
+ 	else {
+ 	    modified = true;
+ 	    j++, n_paths++;
+-	    paths[j].o_ifp = ip;
++	    paths[j].if_addr = paths[j-1].if_addr;
+ 	    paths[j].phyint = paths[j-1].phyint;
+ 	    if (paths[j-1].gw < gw)
+ 		paths[j].gw = gw;
+@@ -188,7 +188,7 @@
+ 
+     // Zero rest of entry
+     for (i = n_paths; i < MAXPATH; i++) {
+-	paths[i].o_ifp = 0;
++	paths[i].if_addr = 0;
+ 	paths[i].phyint = 0;
+ 	paths[i].gw = 0;
+     }
+@@ -218,9 +218,12 @@
+ {
+     int i;
+ 
+-    for (i = 0; i < npaths; i++)
+-	if (NHs[i].o_ifp->area() != a)
++    for (i = 0; i < npaths; i++) {
++        SpfIfc *ip;
++        ip = ospf->find_ifc(NHs[i].if_addr, NHs[i].phyint);
++	if (ip && ip->area() != a)
+ 	    return(false);
++    }
+     return(true);
+ }
+ 
+@@ -317,3 +320,16 @@
+     return(fwde);
+ }
+ 
++/* Find the first outgoing OSPF interface specified
++ * in a routing table entry.
++ */
++
++SpfIfc *RTE::ifc()
++{
++    if (r_mpath && r_mpath->npaths) {
++        NH *nh=&r_mpath->NHs[0];
++	return(ospf->find_ifc(nh->if_addr, nh->phyint));
++    }
++    else
++	return(0);
++}
+diff -abur --exclude-from=exclude_files ospfd1.2/src/rte.h ospfd1.3/src/rte.h
+--- ospfd1.2/src/rte.h	Tue May  2 14:57:09 2000
++++ ospfd1.3/src/rte.h	Tue May  9 18:16:28 2000
+@@ -27,7 +27,7 @@
+  */
+ 
+ struct NH {
+-    SpfIfc *o_ifp;	// Outgoing interface
++    InAddr if_addr; // IP address of outgoing interface
+     int phyint; // Physical interface
+     InAddr gw;	// New hop gateway
+ };
+@@ -121,13 +121,13 @@
+     bool state_changed();
+     void run_transit_areas(class rteLSA *lsap);
+     void set_area(aid_t);
++    SpfIfc *ifc();
+     inline void update(MPath *newnh);
+     inline byte type();
+     inline int valid();
+     inline int intra_area();
+     inline int inter_area();
+     inline int intra_AS();
+-    inline SpfIfc *ifc();
+     inline aid_t area();
+ 
+     friend class SpfArea;
+@@ -159,13 +159,6 @@
+ inline int RTE::intra_AS()
+ {
+     return(r_type == RT_SPF || r_type == RT_SPFIA);
+-}
+-inline SpfIfc *RTE::ifc()
+-{
+-    if (r_mpath && r_mpath->npaths)
+-	return(r_mpath->NHs[0].o_ifp);
+-    else
+-	return(0);
+ }
+ inline aid_t RTE::area()
+ {
+diff -abur --exclude-from=exclude_files ospfd1.2/src/rtrlsa.C ospfd1.3/src/rtrlsa.C
+--- ospfd1.2/src/rtrlsa.C	Tue May  2 14:57:09 2000
++++ ospfd1.3/src/rtrlsa.C	Tue May  9 17:50:04 2000
+@@ -248,6 +248,7 @@
+ 
+     // Start with empty interface map
+     n_ifmap = 0;
++    ifmap_valid = true;
+ 
+     // Build LSA header
+     hdr = ospf->orig_buffer();
+@@ -372,8 +373,10 @@
+ {
+     int i;
+     for (i= 0; i < n_ifmap; i++)
+-	if (ifmap[i] == ip)
++        if (ifmap[i] == ip) {
+ 	    ifmap[i] = 0;
++	    ifmap_valid = false;
++	}
+ }
+ 
+ 
+diff -abur --exclude-from=exclude_files ospfd1.2/src/spfarea.C ospfd1.3/src/spfarea.C
+--- ospfd1.2/src/spfarea.C	Tue May  9 13:55:05 2000
++++ ospfd1.3/src/spfarea.C	Tue May  9 17:45:15 2000
+@@ -223,6 +223,8 @@
+ 	    break;
+ 	}
+     }
++    // Delete from interface map
++    delete_from_ifmap(ip);
+ }
+ 
+ /* An interface to the area has gone up or down. Adjust the
+diff -abur --exclude-from=exclude_files ospfd1.2/src/spfifc.C ospfd1.3/src/spfifc.C
+--- ospfd1.2/src/spfifc.C	Tue May  9 13:57:14 2000
++++ ospfd1.3/src/spfifc.C	Tue May  9 17:48:27 2000
+@@ -249,8 +249,6 @@
+ 	    break;
+ 	}
+     }
+-    // Delete from interface map
+-    if_area->delete_from_ifmap(this);
+     // Free from area list
+     if_area->RemoveIfc(this);
+     // Close physical interface

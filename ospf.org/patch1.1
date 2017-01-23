@@ -1,0 +1,62 @@
+diff -abur -X exclude_files ospfd/src/ospf.C ospfd1.1/src/ospf.C
+--- ospfd/src/ospf.C	Mon Jan 10 02:07:34 2000
++++ ospfd1.1/src/ospf.C	Fri Feb 11 17:33:38 2000
+@@ -378,6 +378,7 @@
+     else {
+         hp->r_cost = m->cost;
+ 	hp->updated = true;
++	hp->ip->updated = true;
+     }
+     // Reoriginate area's router-LSA
+     ap->rl_orig();
+diff -abur -X exclude_files ospfd/src/ospf.h ospfd1.1/src/ospf.h
+--- ospfd/src/ospf.h	Mon Dec 13 05:09:34 1999
++++ ospfd1.1/src/ospf.h	Fri Feb 11 17:32:53 2000
+@@ -257,7 +257,7 @@
+   public:
+     // Version numbers
+     enum {
+-	vmajor = 0,	// Major version number
++	vmajor = 1,	// Major version number
+ 	vminor = 1,	// Minor version number
+     };
+ 
+diff -abur -X exclude_files ospfd/src/spfifc.C ospfd1.1/src/spfifc.C
+--- ospfd/src/spfifc.C	Thu Nov 25 09:39:08 1999
++++ ospfd1.1/src/spfifc.C	Fri Feb 11 17:35:33 2000
+@@ -449,6 +449,10 @@
+   return(IFT_LOOPBK);
+ }
+ 
++void LoopIfc::run_fsm(int)
++
++{
++}
+ 
+ /* If an interface has not been mentioned in a reconfig, just
+  * remove it.
+diff -abur -X exclude_files ospfd/src/spfifc.h ospfd1.1/src/spfifc.h
+--- ospfd/src/spfifc.h	Fri Oct 22 04:23:58 1999
++++ ospfd1.1/src/spfifc.h	Fri Feb 11 17:34:16 2000
+@@ -186,7 +186,6 @@
+     int verify(Pkt *pdesc, class SpfNbr *np);
+     void md5_generate(Pkt *pdesc);
+     int md5_verify(Pkt *pdesc, class SpfNbr *np);
+-    void run_fsm(int event);// Interface Finite state machine
+     void recv_hello(Pkt *pdesc);
+     void send_hello(bool empty=false);
+     int build_hello(Pkt *, uns16 size);
+@@ -203,6 +202,7 @@
+     void reorig_all_grplsas();
+ 
+     // Virtual functions
++    virtual void run_fsm(int event);// Interface Finite state machine
+     virtual void clear_config();
+     virtual void if_send(Pkt *, InAddr);
+     virtual void nbr_send(Pkt *, SpfNbr *); // send OSPF packet to neighbor
+@@ -443,4 +443,5 @@
+     virtual RtrLink *rl_insert(RTRhdr *, RtrLink *);
+     virtual void add_adj_to_cand(class PriQ &cand);
+     virtual int type();
++    virtual void run_fsm(int event);// Interface Finite state machine
+ };

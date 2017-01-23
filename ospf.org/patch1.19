@@ -1,0 +1,426 @@
+diff -X exclude_files -Nabur ospfd1.18/linux/ospfd.tcl ospfd1.19/linux/ospfd.tcl
+--- ospfd1.18/linux/ospfd.tcl	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/linux/ospfd.tcl	Fri Dec  8 12:17:05 2000
+@@ -47,6 +47,7 @@
+ set global_att(base_level) 4
+ set global_att(host) 0
+ set global_att(refresh_rate) 0
++set global_att(PPAdjLimit) 0
+ 
+ ###############################################################
+ # Top-level commands to set global parameters
+@@ -62,6 +63,7 @@
+ #	dd_sessions %no
+ #	log_level %no
+ #	refresh_rate %seconds
++#	PPAdjLimit %no
+ ###############################################################
+ 
+ proc ospfExtLsdbLimit {val} {
+@@ -104,6 +106,10 @@
+     global global_att
+     set global_att(refresh_rate) $secs
+ }
++proc PPAdjLimit {nadj} {
++    global global_att
++    set global_att(PPAdjLimit) $nadj
++}
+ 
+ ###############################################################
+ # Area configuration:
+@@ -430,7 +436,8 @@
+ 	    $global_att(inter_area_mc) $global_att(ovfl_int) \
+ 	    $global_att(new_flood_rate) $global_att(max_rxmt_window) \
+ 	    $global_att(max_dds) $global_att(base_level) \
+-	    $global_att(host) $global_att(refresh_rate)
++	    $global_att(host) $global_att(refresh_rate) \
++	    $global_att(PPAdjLimit)
+     foreach a $areas {
+ 	sendarea $a $area_att($a,stub) $area_att($a,dflt_cost) \
+ 		$area_att($a,import_summs)
+diff -X exclude_files -Nabur ospfd1.18/linux/ospfd_linux.C ospfd1.19/linux/ospfd_linux.C
+--- ospfd1.18/linux/ospfd_linux.C	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/linux/ospfd_linux.C	Fri Dec  8 12:17:05 2000
+@@ -807,6 +807,7 @@
+     m.host_mode = atoi(argv[9]);
+     m.log_priority = atoi(argv[8]);
+     m.refresh_rate = atoi(argv[10]);
++    m.PPAdjLimit = atoi(argv[11]);
+     ospf->cfgOspf(&m);
+ 
+     return(TCL_OK);
+diff -X exclude_files -Nabur ospfd1.18/ospf_sim/ospf_sim.tcl ospfd1.19/ospf_sim/ospf_sim.tcl
+--- ospfd1.18/ospf_sim/ospf_sim.tcl	Tue Dec  5 14:34:57 2000
++++ ospfd1.19/ospf_sim/ospf_sim.tcl	Fri Dec  8 12:17:09 2000
+@@ -79,6 +79,7 @@
+ #	loopback %rtr_id %prefix %area
+ #	neighbor %rtr_id %addr %drpri
+ #	membership %prefix %group
++#	PPAdjLimit %rtr_id %nadj
+ #
+ # Almost all of these operations can also be accomplished
+ # through the GUI.
+@@ -88,6 +89,7 @@
+     global router_att
+     set router_att($rtr_id,host) 0
+     set router_att($rtr_id,mospf) $mospf
++    set router_att($rtr_id,PPAdjLimit) 0
+     router_or_host $rtr_id $x $y
+ }
+ 
+@@ -95,6 +97,7 @@
+     global router_att
+     set router_att($rtr_id,host) 1
+     set router_att($rtr_id,mospf) 0
++    set router_att($rtr_id,PPAdjLimit) 0
+     router_or_host $rtr_id $x $y
+ }
+ 
+@@ -391,6 +394,16 @@
+ }
+ 
+ ###############################################################
++# Limit the number of p-p adjacencies from this router to
++# any of its neighbors
++###############################################################
++
++proc PPAdjLimit {rtr_id nadj} {
++    global router_att
++    set router_att($rtr_id,PPAdjLimit) $nadj
++}
++
++###############################################################
+ # Send entire configuration to a
+ # given router (i.e., simulated ospfd).
+ ###############################################################
+@@ -399,7 +412,8 @@
+     global router_att area_att ifc_att vlink_att
+     global aggr_att route_att host_att nbr_att node_att
+     global networks network_att
+-    sendgen $rtr_id $router_att($rtr_id,host) $router_att($rtr_id,mospf)
++    sendgen $rtr_id $router_att($rtr_id,host) $router_att($rtr_id,mospf) \
++	    $router_att($rtr_id,PPAdjLimit)
+     foreach a $router_att($rtr_id,areas) {
+ 	sendarea $rtr_id $a $area_att($a,stub) $area_att($a,default_cost) \
+ 		$area_att($a,import)
+@@ -1396,6 +1410,9 @@
+ 	} else {
+ 	    puts $f [concat "host" $id $node_att($id,x) $node_att($id,y) \
+ 		    $router_att($id,mospf)]
++	}
++	if {$router_att($id,PPAdjLimit) != 0} {
++	    puts $f [concat "PPAdjLimit" $id $router_att($id,PPAdjLimit)]
+ 	}
+     }
+     foreach net $networks {
+diff -X exclude_files -Nabur ospfd1.18/ospf_sim/sim.C ospfd1.19/ospf_sim/sim.C
+--- ospfd1.18/ospf_sim/sim.C	Tue Dec  5 14:34:57 2000
++++ ospfd1.19/ospf_sim/sim.C	Fri Dec  8 12:17:09 2000
+@@ -941,6 +941,7 @@
+     m.host_mode = atoi(argv[2]);
+     m.log_priority = 2;
+     m.refresh_rate = 6000;
++    m.PPAdjLimit = atoi(argv[4]);
+     node->pktdata.queue_xpkt(&m, SIM_CONFIG, CfgType_Gen, len);
+ 
+     return(TCL_OK);
+diff -X exclude_files -Nabur ospfd1.18/src/config.h ospfd1.19/src/config.h
+--- ospfd1.18/src/config.h	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/src/config.h	Fri Dec  8 12:17:05 2000
+@@ -54,6 +54,7 @@
+     byte host_mode;	// Don't forward data packets?
+     int log_priority;	// Logging message priority
+     int32 refresh_rate;	// Rate to refresh DoNotAge LSAs
++    uns32 PPAdjLimit;	// Max # p-p adjacencies to neighbor
+ 
+     void set_defaults();
+ };
+diff -X exclude_files -Nabur ospfd1.18/src/nbrfsm.C ospfd1.19/src/nbrfsm.C
+--- ospfd1.18/src/nbrfsm.C	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/src/nbrfsm.C	Fri Dec  8 12:17:05 2000
+@@ -241,6 +241,7 @@
+ 	ospf->n_dbx_nbrs++;
+     // Never go from Full state immed back into dbxchng
+     else if (n_ostate == NBS_FULL) {
++        (void) n_ifp->more_adjacencies_needed(id(), true);
+ 	if (n_ifp->if_nfull-- == 1)
+ 	    n_ifp->reorig_all_grplsas();
+ 	if (tap && tap->n_VLs-- == 1)
+@@ -248,6 +249,7 @@
+ 	ap->rl_orig();
+     }
+     else if (n_state <= NBS_2WAY && n_ostate >= NBS_EXST) {
++        (void) n_ifp->more_adjacencies_needed(id(), true);
+ 	exit_dbxchg();
+ 	if (n_ostate > NBS_EXST)
+ 	    ospf->n_dbx_nbrs--;
+@@ -257,11 +259,17 @@
+     if (n_ifp->state() == IFS_DR)
+ 	n_ifp->nl_orig(false);
+ 
+-    // If necessary, run Interface state machine with event
+-    // NeighborChange
++    /* If necessary, run Interface state machine with event
++     * NeighborChange
++     * Also, schedule routing calculation if we are
++     * limiting point-to-point adjacencies
++     */
+     if ((n_state >= NBS_2WAY && n_ostate < NBS_2WAY) ||
+-	(n_state < NBS_2WAY && n_ostate >= NBS_2WAY))
++	(n_state < NBS_2WAY && n_ostate >= NBS_2WAY)) {
+ 	n_ifp->run_fsm(IFE_NCHG);
++	if (ospf->PPAdjLimit != 0 && n_ifp->type() == IFT_PP)
++	    ospf->full_sched = true;
++    }
+ }
+ 
+ 
+@@ -278,6 +286,8 @@
+     n_state = NBS_2WAY;
+     if (!n_ifp->adjacency_wanted(this))
+ 	DelPendAdj();
++    else if (!n_ifp->more_adjacencies_needed(id(), false))
++	DelPendAdj();
+     else if (ospf->n_lcl_inits < ospf->max_dds) {
+ 	n_state = NBS_EXST;
+ 	ospf->n_lcl_inits++;
+@@ -538,6 +548,8 @@
+     SpfNbr *prev;
+     SpfNbr *nbr;
+ 
++    if (!n_adj_pend)
++        return;
+     prev = 0;
+     for (ptr = &ospf->g_adj_head; ; prev = nbr, ptr = &nbr->n_next_pend) {
+ 	if (!(nbr = *ptr))
+diff -X exclude_files -Nabur ospfd1.18/src/ospf.C ospfd1.19/src/ospf.C
+--- ospfd1.18/src/ospf.C	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/src/ospf.C	Fri Dec  8 12:17:05 2000
+@@ -68,6 +68,7 @@
+     max_dds = 2;		// # simultaneous DB exchanges
+     host_mode = 0;		// act as router
+     refresh_rate = 0;		// Don't originate DoNotAge LSAs
++    PPAdjLimit = 0;		// Don't limit p-p adjacencies
+ 
+     myaddr = 0;
+     n_extImports = 0;
+@@ -235,6 +236,7 @@
+     }
+     base_priority = m->log_priority;
+     refresh_rate = m->refresh_rate;
++    PPAdjLimit = m->PPAdjLimit;
+     sys->ip_forward(host_mode == 0);
+ 
+     updated = true;
+@@ -261,6 +263,7 @@
+     host_mode = 0;	// act as router
+     log_priority = 4;	// Base logging priority
+     refresh_rate = 0;	// Don't originate DoNotAge LSAs
++    PPAdjLimit = 0;	// Don't limit p-p adjacencies
+     sys->ip_forward(true);
+ }
+ 
+diff -X exclude_files -Nabur ospfd1.18/src/ospf.h ospfd1.19/src/ospf.h
+--- ospfd1.18/src/ospf.h	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/src/ospf.h	Fri Dec  8 12:17:05 2000
+@@ -57,6 +57,7 @@
+     byte max_dds;	// # simultaneous DB exchanges
+     byte host_mode;	// Don't forward data packets?
+     int32 refresh_rate;	// Rate to refresh DoNotAge LSAs
++    uns32 PPAdjLimit;	// Max # p-p adjacencies to neighbor
+     // Dynamic data
+     InAddr myaddr;	// Global address: source on unnumbered
+     bool wakeup; 	// Timers running?
+@@ -260,7 +261,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 18,	// Minor version number
++	vminor = 19,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -X exclude_files -Nabur ospfd1.18/src/spfcalc.C ospfd1.19/src/spfcalc.C
+--- ospfd1.18/src/spfcalc.C	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/src/spfcalc.C	Fri Dec  8 12:17:05 2000
+@@ -27,6 +27,7 @@
+ 
+ #include "ospfinc.h"
+ #include "system.h"
++#include "nbrfsm.h"
+ 
+ /* A new LSA has been received that we didn't have before, or
+  * whose contents have changed. Schedule the appropriate
+@@ -489,6 +490,7 @@
+ 	else
+ 	    t_gw = ospf_find_gw(V, t_ifc->net(), t_ifc->mask());
+ 	new_nh = MPath::create(t_ifc, t_gw);
++	new_nh = t_ifc->add_parallel_links(new_nh, this);
+     }
+     // Not adjacent to root, simply inherit
+     else if (!V->t_direct || V->ls_type() != LST_NET)
+@@ -858,4 +860,54 @@
+ 	// Clear multicast cache with this source
+ 	ospf->mospf_clear_inter_source(this);
+     }
++}
++
++/* When we are limiting the adjacencies formed over
++ * parallel point-to-point links, add all links in
++ * state 2-Way as next hops.
++ */
++
++MPath *SpfIfc::add_parallel_links(MPath *new_nh, TNode *dst)
++
++{
++    return(new_nh);
++}
++
++MPath *VLIfc::add_parallel_links(MPath *new_nh, TNode *dst)
++
++{
++    return(new_nh);
++}
++
++MPath *PPIfc::add_parallel_links(MPath *new_nh, TNode *dst)
++
++{
++    rtid_t nbr_id;
++    IfcIterator iter(if_area);
++    SpfIfc *ip;
++
++    nbr_id = dst->ls_id();
++    if (ospf->PPAdjLimit == 0)
++        return(new_nh);
++    while ((ip = iter.get_next())) {
++        SpfNbr *np;
++	if (ip == this)
++	    continue;
++        if (ip->type() != IFT_PP)
++	    continue;
++	if (!(np = ip->if_nlst))
++	    continue;
++	// To this same neighbor?
++	if (np->id() != nbr_id)
++	    continue;
++	if (np->n_state == NBS_2WAY) {
++	    InAddr t_gw;
++	    MPath *add_nh;
++	    t_gw = dst->ospf_find_gw(if_area->mylsa, ip->net(), ip->mask());
++	    add_nh = MPath::create(ip, t_gw);
++	    new_nh = MPath::merge(new_nh, add_nh);
++	}
++    }
++
++    return(new_nh);
+ }
+diff -X exclude_files -Nabur ospfd1.18/src/spfifc.C ospfd1.19/src/spfifc.C
+--- ospfd1.18/src/spfifc.C	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/src/spfifc.C	Fri Dec  8 12:17:05 2000
+@@ -1044,3 +1044,59 @@
+ 	np->n_htim.stop();
+ }
+ 
++/* If OSPF::PPAdjLimit is non-zero, we limit the number
++ * of point-to-point links which will become adjacent
++ * to a particular neighbor. If the "enlist" parameter
++ * is true, and there are insufficient adjacencies, we
++ * add all the 2-Way point-to-point interfaces to the
++ * pending adjacency list, since we don't know which
++ * ones we will be able to advance.
++ */
++
++bool SpfIfc::more_adjacencies_needed(rtid_t, bool enlist)
++
++{
++    return(true);
++}
++
++bool VLIfc::more_adjacencies_needed(rtid_t, bool enlist)
++
++{
++    return(true);
++}
++
++bool PPIfc::more_adjacencies_needed(rtid_t nbr_id, bool enlist)
++
++{
++    IfcIterator iter(if_area);
++    int n_adj;
++    bool more_needed=true;
++    SpfIfc *ip;
++
++    if (ospf->PPAdjLimit == 0)
++        return(true);
++    // End with higher router ID will decide
++    if (nbr_id  > ospf->my_id())
++        return(false);
++    for (n_adj = 0; more_needed && (ip = iter.get_next()); ) {
++        SpfNbr *np;
++        if (ip->type() != IFT_PP)
++	    continue;
++	if (!(np = ip->if_nlst))
++	    continue;
++	// To this same neighbor?
++	if (np->id() != nbr_id)
++	    continue;
++	if (np->n_state >= NBS_EXST) {
++	    n_adj++;
++	    more_needed = (n_adj < (int) ospf->PPAdjLimit);
++	}
++	else if (np->n_state == NBS_2WAY) {
++	    if (!more_needed)
++	        np->DelPendAdj();
++	    else if (enlist)
++	        np->AddPendAdj();
++	}
++    }
++    return(more_needed);
++}
+diff -X exclude_files -Nabur ospfd1.18/src/spfifc.h ospfd1.19/src/spfifc.h
+--- ospfd1.18/src/spfifc.h	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/src/spfifc.h	Fri Dec  8 12:17:05 2000
+@@ -228,6 +228,8 @@
+     virtual void restart_hellos();
+     virtual void stop_hellos();
+     virtual bool elects_dr();
++    virtual bool more_adjacencies_needed(rtid_t, bool enlist);
++    virtual MPath *add_parallel_links(MPath *, TNode *);
+ 
+     friend class PhyInt;
+     friend class IfcIterator;
+@@ -322,6 +324,8 @@
+     virtual RtrLink *rl_insert(RTRhdr *, RtrLink *);
+     virtual int rl_size();
+     virtual void add_adj_to_cand(class PriQ &cand);
++    virtual bool more_adjacencies_needed(rtid_t, bool enlist);
++    virtual MPath *add_parallel_links(MPath *, TNode *);
+ };
+ 
+ inline PPIfc::PPIfc(InAddr addr, int phyint) : SpfIfc(addr, phyint)
+@@ -345,6 +349,8 @@
+     virtual RtrLink *rl_insert(RTRhdr *, RtrLink *);
+     void update(class RTRrte *endpt);
+     friend class OSPF;
++    virtual bool more_adjacencies_needed(rtid_t, bool enlist);
++    virtual MPath *add_parallel_links(MPath *, TNode *);
+ };
+ 
+ /* Interfaces that elect Designated Routers. The broadcast interface
+diff -X exclude_files -Nabur ospfd1.18/src/spflood.C ospfd1.19/src/spflood.C
+--- ospfd1.18/src/spflood.C	Tue Dec  5 14:34:56 2000
++++ ospfd1.19/src/spflood.C	Fri Dec  8 12:17:05 2000
+@@ -44,8 +44,12 @@
+     LShdr *hdr;
+     byte *end_lsa;
+ 
+-    if (n_state < NBS_EXCH)
++    if (n_state < NBS_EXCH) {
++        if (n_ifp->type() == IFT_PP)
++	    // Tell neighbor there is no adjacency
++	    n_ifp->send_hello(true);
+ 	return;
++    }
+ 
+     ip = n_ifp;
+     ap = ip->area();

@@ -1,0 +1,14 @@
+diff -Nabur --exclude-from=exclude_files ospfd1.13/src/spfvl.C ospfd1.14/src/spfvl.C
+--- ospfd1.13/src/spfvl.C	Thu Sep  7 17:17:14 2000
++++ ospfd1.14/src/spfvl.C	Thu Sep  7 17:30:05 2000
+@@ -39,6 +39,10 @@
+     RTRrte *endpt;
+     SpfArea *bb;
+ 
++    // Don't allow virtual links to self
++    if (m->nbr_id == my_id())
++        return;
++
+     /* Find virtual link by looking up transit area,
+      * and then the other endpoint's routing table
+      * entry.

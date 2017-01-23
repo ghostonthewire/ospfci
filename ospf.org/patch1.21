@@ -1,0 +1,86 @@
+diff -X exclude_files -Nabur ospfd1.20/src/ospf.h ospfd1.21/src/ospf.h
+--- ospfd1.20/src/ospf.h	Tue Dec 26 10:16:43 2000
++++ ospfd1.21/src/ospf.h	Tue Jan  9 13:08:56 2001
+@@ -261,7 +261,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 19,	// Minor version number
++	vminor = 21,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -X exclude_files -Nabur ospfd1.20/src/spflood.C ospfd1.21/src/spflood.C
+--- ospfd1.20/src/spflood.C	Tue Dec 26 10:16:43 2000
++++ ospfd1.21/src/spflood.C	Tue Jan  9 13:08:56 2001
+@@ -210,6 +210,8 @@
+  * also stop the delayed ack by zeroing out the LSA's from
+  * field). Returns whether any buffer allocation failures were
+  * encountered.
++ * Must do demand circuit refresh inhibition *after* removing
++ * requests from the link-state request list.
+  */
+ 
+ void LSA::flood(SpfNbr *from, LShdr *hdr)
+@@ -237,8 +239,6 @@
+ 	int n_nbrs;
+ 
+ 	ap = ip->area();
+-	if (ip->demand_flooding(lstype) && !changed)
+-	    continue;
+ 	if (lstype == LST_ASL && ap->is_stub())
+ 	    continue;
+ 	if (lstype == LST_ASL && ip->is_virtual())
+@@ -258,6 +258,8 @@
+ 		continue;
+ 	    if (lstype == LST_GM && (!np->supports(SPO_MC)))
+ 		continue;
++	    if (ip->demand_flooding(lstype) && !changed)
++	        continue;
+ 
+ 	    // Add to neighbor retransmission list
+ 	    n_nbrs++;
+diff -X exclude_files -Nabur ospfd1.20/src/spforig.C ospfd1.21/src/spforig.C
+--- ospfd1.20/src/spforig.C	Tue Dec 26 10:16:43 2000
++++ ospfd1.21/src/spforig.C	Tue Jan  9 13:08:56 2001
+@@ -34,6 +34,7 @@
+ 
+ {
+     LSA *lsap;
++    bool flush_it;
+ 
+     if ((ntoh32(hdr->ls_org) != my_id()) &&
+ 	(hdr->ls_type != LST_NET || !find_ifc(ntoh32(hdr->ls_id))))
+@@ -42,22 +43,25 @@
+     // Have received update of self-originated LSA
+     if (spflog(LOG_SELFORIG, 4))
+ 	log(hdr);
++    /* We are now going to update the LSA to reflect
++     * our database copy. Temporarily install the
++     * received LSA so that the demand circuit logic will
++     * correctly detect contents changes. Can't reference
++     * database_copy after it is replaced in database.
++     */
++    flush_it = (!database_copy) || database_copy->lsa_age() == MaxAge;
++    lsap = AddLSA(ap, database_copy, hdr, true);
+     // Flush if don't want to advertise
+     // Otherwise, simply bump database copy's sequence number
+-    if (ntoh32(hdr->ls_org) != my_id() ||
+-	(!database_copy) ||
+-	database_copy->lsa_age() == MaxAge) {
+-	lsap = AddLSA(ap, database_copy, hdr, true);
++    if (ntoh32(hdr->ls_org) != my_id() || flush_it) {
+ 	age_prematurely(lsap);
+     }
+     else if (ntoh32(hdr->ls_seqno) == (seq_t) MaxLSSeq) {
+-	lsap = AddLSA(ap, database_copy, hdr, true);
+ 	lsap->rollover = true;
+ 	age_prematurely(lsap);
+-	return(true);
+     }
+     else
+-	database_copy->refresh(ntoh32(hdr->ls_seqno));
++	lsap->refresh(ntoh32(hdr->ls_seqno));
+ 
+     return(true);
+ }

@@ -1,0 +1,27 @@
+diff -abur --exclude-from=exclude_files ospfd1.7/src/asexlsa.C ospfd1.8/src/asexlsa.C
+--- ospfd1.7/src/asexlsa.C	Fri Jun  2 11:25:15 2000
++++ ospfd1.8/src/asexlsa.C	Fri Jun  2 11:40:10 2000
+@@ -501,7 +501,11 @@
+ void ExitOverflowTimer::action()
+ 
+ {
++    if (ospf->n_exlsas >= ospf->ExtLsdbLimit)
++	return;
++
+     ospf->OverflowState = false;
++    stop();
+     // Reoriginate AS-external-LSAs
+     // by rerunning AS-external routing calculations
+     ospf->reoriginate_ASEs();
+diff -abur --exclude-from=exclude_files ospfd1.7/src/ospf.h ospfd1.8/src/ospf.h
+--- ospfd1.7/src/ospf.h	Fri Jun  2 11:25:15 2000
++++ ospfd1.8/src/ospf.h	Fri Jun  2 11:40:10 2000
+@@ -26,7 +26,7 @@
+ 
+ // Exit database overflow timer.
+ 
+-class ExitOverflowTimer : public Timer {
++class ExitOverflowTimer : public ITimer {
+   public:
+     virtual void action();
+ };

@@ -1,0 +1,25 @@
+diff -Nabur --exclude-from=exclude_files ospfd1.10/src/ospf.h ospfd1.11/src/ospf.h
+--- ospfd1.10/src/ospf.h	Mon Jun 26 17:54:48 2000
++++ ospfd1.11/src/ospf.h	Wed Aug 23 16:09:52 2000
+@@ -258,7 +258,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 10,	// Minor version number
++	vminor = 11,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+diff -Nabur --exclude-from=exclude_files ospfd1.10/src/spfifc.C ospfd1.11/src/spfifc.C
+--- ospfd1.10/src/spfifc.C	Mon Jun 26 17:54:48 2000
++++ ospfd1.11/src/spfifc.C	Wed Aug 23 16:09:52 2000
+@@ -129,6 +129,9 @@
+ 	nbr_change = true;
+     }
+     // Interface cost
++    // First verify cost
++    if (m->if_cost == 0)
++        m->if_cost = 1;
+     if (ip->if_cost != m->if_cost) {
+ 	ip->if_cost = m->if_cost;
+ 	new_lsa = true;

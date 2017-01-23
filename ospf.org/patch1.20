@@ -1,0 +1,24 @@
+diff -X exclude_files -Nabur ospfd1.19/src/lsalist.C ospfd1.20/src/lsalist.C
+--- ospfd1.19/src/lsalist.C	Fri Dec  8 12:17:05 2000
++++ ospfd1.20/src/lsalist.C	Tue Dec 26 10:16:43 2000
+@@ -33,7 +33,7 @@
+  * and a certain amount of overhead.
+  */
+ 
+-void *LsaListElement::operator new(int)
++void *LsaListElement::operator new(size_t)
+ 
+ {
+     LsaListElement *ep;
+diff -X exclude_files -Nabur ospfd1.19/src/lsalist.h ospfd1.20/src/lsalist.h
+--- ospfd1.19/src/lsalist.h	Fri Dec  8 12:17:05 2000
++++ ospfd1.20/src/lsalist.h	Tue Dec 26 10:16:43 2000
+@@ -46,7 +46,7 @@
+     static int n_allocated;		// # list elements allocated
+     static int n_free;		// # list elements free
+ 
+-    void * operator new(int size);
++    void * operator new(size_t size);
+     void operator delete(void *ptr, size_t);
+     inline LsaListElement(LSA *);
+     inline ~LsaListElement();

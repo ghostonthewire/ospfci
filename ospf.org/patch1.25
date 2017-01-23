@@ -1,0 +1,572 @@
+diff -X exclude_files -Nabur ospfd1.24/linux/linux.C ospfd1.25/linux/linux.C
+--- ospfd1.24/linux/linux.C	Thu Jan 25 15:44:23 2001
++++ ospfd1.25/linux/linux.C	Thu Feb  1 10:35:34 2001
+@@ -216,14 +216,15 @@
+ 
+ {
+     char *string;
+-    char *netstr;
++    char netstr[16];
+     int len;
+ 
+-    string = prefix;
+-    if (!(netstr = strsep(&string, "/")))
++    if (!(string = index(prefix, '/')))
+ 	return(false);
++    memcpy(netstr, prefix, string-prefix);
++    netstr[string-prefix] = '\0';
+     net = ntoh32(inet_addr(netstr));
+-    len = atoi(string);
++    len = atoi(string+1);
+     if (len < 0 || len > 32)
+ 	return(false);
+     mask = masks[len];
+diff -X exclude_files -Nabur ospfd1.24/linux/ospfd.tcl ospfd1.25/linux/ospfd.tcl
+--- ospfd1.24/linux/ospfd.tcl	Thu Jan 25 15:44:23 2001
++++ ospfd1.25/linux/ospfd.tcl	Thu Feb  1 10:35:34 2001
+@@ -32,10 +32,12 @@
+ global {thisifc}
+ global {thisaggr}
+ global {route_att}
++global {route_index}
+ global {thisrt}
+ 
+ set areas {}
+ set routes {}
++set route_index 0
+ set thisarea "0.0.0.0"
+ set global_att(lsdb_limit) 0
+ set global_att(mospf_enabled) 0
+@@ -382,17 +384,16 @@
+ ###############################################################
+ 
+ proc route {pr nexth type metric} {
+-    global routes route_att thisrt
+-    if {[lsearch $routes $pr] != -1} {
+-	return;
+-    }
+-    lappend routes $pr
+-    set thisrt $pr
+-    set route_att($pr,nh) $nexth
+-    set route_att($pr,exttype) $type
+-    set route_att($pr,cost) $metric
+-    set route_att($pr,mcsrc) 0
+-    set route_att($pr,exttag) 0
++    global routes route_att thisrt route_index
++    lappend routes $route_index
++    set thisrt $route_index
++    incr route_index
++    set route_att($thisrt,prefix) $pr
++    set route_att($thisrt,nh) $nexth
++    set route_att($thisrt,exttype) $type
++    set route_att($thisrt,cost) $metric
++    set route_att($thisrt,mcsrc) 0
++    set route_att($thisrt,exttag) 0
+ }
+ 
+ proc mcsource {} {
+@@ -481,7 +482,7 @@
+ 	}
+     }
+     foreach r $routes {
+-	sendextrt $r $route_att($r,nh) \
++	sendextrt $route_att($r,prefix) $route_att($r,nh) \
+ 		$route_att($r,exttype)  $route_att($r,cost) \
+ 		$route_att($r,mcsrc) $route_att($r,exttag)
+     }
+diff -X exclude_files -Nabur ospfd1.24/linux/ospfd_linux.C ospfd1.25/linux/ospfd_linux.C
+--- ospfd1.24/linux/ospfd_linux.C	Thu Jan 25 15:44:23 2001
++++ ospfd1.25/linux/ospfd_linux.C	Thu Feb  1 10:35:34 2001
+@@ -274,7 +274,6 @@
+ 	ifaddrmsg *ifm;
+ 	rtattr *rta;
+ 	int rta_len;
+-	BSDPhyInt *phyp;
+ 	rtmsg *rtm;
+ 	InAddr net;
+ 	InMask mask;
+@@ -282,9 +281,7 @@
+ 	ifinfo = (ifinfomsg *)NLMSG_DATA(msg);
+ 	syslog(LOG_NOTICE, "Ifc change IfIndex %d flags 0x%x",
+ 	       ifinfo->ifi_index, ifinfo->ifi_flags);
+-	if ((phyp = phys[ifinfo->ifi_index]))
+-	    set_flags(phyp, (short) ifinfo->ifi_flags);
+-	else if ((ifinfo->ifi_flags & IFF_LOOPBACK) == 0)
++	if ((ifinfo->ifi_flags & IFF_LOOPBACK) == 0)
+ 	    read_config();
+ 	break;
+       case RTM_DELLINK:	// Interface deletion
+@@ -594,6 +591,8 @@
+     size_t size;
+     char *ifcbuf;
+     int blen;
++    AVLsearch iter(&directs);
++    DirectRoute *rte;
+ 
+     blen = MAXIFs*sizeof(ifreq);
+     ifcbuf = new char[blen];
+@@ -610,7 +609,8 @@
+      * them.
+      */
+     interface_map.clear();
+-    directs.clear();
++    while ((rte = (DirectRoute *)iter.next()))
++        rte->valid = false;
+ 
+     ifrp = (ifreq *) ifcbuf;
+     end = (ifreq *)(ifcbuf + cfgreq.ifc_len);
+@@ -683,8 +683,8 @@
+ 	}
+ 	insock = (sockaddr_in *) &ifr.ifr_addr;
+ 	phyp->mask = ntoh32(insock->sin_addr.s_addr);
+-	add_direct(addr, phyp->mask);
+-	add_direct(addr, 0xffffffffL);
++	add_direct(phyp, addr, phyp->mask);
++	add_direct(phyp, addr, 0xffffffffL);
+ 	// Get interface MTU
+ 	phyp->mtu = ((phyp->flags & IFF_BROADCAST) != 0) ? 1500 : 576;
+ 	if (ioctl(udpfd, SIOCGIFMTU, (char *)&ifr) >= 0)
+@@ -694,7 +694,7 @@
+ 	if ((phyp->flags & IFF_POINTOPOINT) != 0 &&
+ 	    (ioctl(udpfd, SIOCGIFDSTADDR, (char *)&ifr) >= 0)) {
+ 	    addr = phyp->dstaddr = ntoh32(insock->sin_addr.s_addr);
+-	    add_direct(addr, 0xffffffffL);
++	    add_direct(phyp, addr, 0xffffffffL);
+ 	}
+ 	// Install map from IP address to physical interface
+ 	if (!interface_map.find(addr, 0)) {
+@@ -704,6 +704,25 @@
+ 	}
+     }
+ 
++    /* Put back any routes that were obscured by formerly
++     * operational direct routes. Take away routes that are
++     * now supplanted by direct routes.
++     */
++    iter.seek(0, 0);
++    while ((rte = (DirectRoute *)iter.next())) {
++        InAddr net=rte->index1();
++	InMask mask=rte->index2();
++        if (!rte->valid) {
++	    directs.remove(rte);
++	    delete rte;
++	    ospf->krt_delete_notification(net, mask);
++	}	    
++#if LINUX_VERSION_CODE >= LINUX22
++	else
++	    sys->rtdel(net, mask, 0);
++#endif
++    }
++
+     delete [] ifcbuf;
+ }
+ 
+@@ -730,15 +749,18 @@
+  * we will let the kernel manage directly.
+  */
+ 
+-void LinuxOspfd::add_direct(InAddr addr, InMask mask)
++void LinuxOspfd::add_direct(BSDPhyInt *phyp, InAddr addr, InMask mask)
+ 
+ {
++    DirectRoute *rte;
++    if ((phyp->flags & IFF_UP) == 0)
++        return;
+     addr = addr & mask;
+-    if (!directs.find(addr, mask)) {
+-	AVLitem *item;
+-	item = new AVLitem(addr, mask);
+-	directs.add(item);
++    if (!(rte = (DirectRoute *)directs.find(addr, mask))) {
++	rte = new DirectRoute(addr, mask);
++	directs.add(rte);
+     }
++    rte->valid = true;
+ }
+ 
+ /* Parse an interface identifier, which can either be an address
+diff -X exclude_files -Nabur ospfd1.24/linux/ospfd_linux.h ospfd1.25/linux/ospfd_linux.h
+--- ospfd1.24/linux/ospfd_linux.h	Thu Jan 25 15:44:23 2001
++++ ospfd1.25/linux/ospfd_linux.h	Thu Feb  1 10:35:34 2001
+@@ -65,7 +65,7 @@
+     void read_kernel_interfaces();
+     void one_second_timer();
+     void rtentry_prepare(InAddr, InMask, MPath *mpp);
+-    void add_direct(InAddr, InMask);
++    void add_direct(class BSDPhyInt *, InAddr, InMask);
+     int get_phyint(InAddr);
+     bool parse_interface(char *, in_addr &, BSDPhyInt * &);
+     void raw_receive(int fd);
+@@ -111,6 +111,18 @@
+ {
+     phyp = _phyp;
+ }
++
++/* Store one of the directly connected prefixes, with an indication
++ * as to whether it is still valid. This enables us to
++ * ask OSPF whether it has better information when a direct
++ * interface is no longer available.
++ */
++
++class DirectRoute : public AVLitem {
++  public:
++    bool valid;
++    DirectRoute(InAddr addr, InMask mask) : AVLitem(addr, mask) {}
++};
+ 
+ // Maximum size of an IP packet
+ const int MAX_IP_PKTSIZE = 65535;
+diff -X exclude_files -Nabur ospfd1.24/src/asexlsa.C ospfd1.25/src/asexlsa.C
+--- ospfd1.24/src/asexlsa.C	Thu Jan 25 15:44:22 2001
++++ ospfd1.25/src/asexlsa.C	Thu Feb  1 10:35:33 2001
+@@ -73,8 +73,16 @@
+ ExRtData::ExRtData(InAddr xnet, InAddr xmask)
+ {
+     rte = inrttbl->add(xnet, xmask);
++    // Enqueue into routing table entry
++    sll_rte = rte->exlist;
++    rte->exlist = this;
++    // Force re-issue of AS-external-LSA
++    forced = true;
+     sll_pend = 0;
+     orig_pending = false;
++    // May have become an ASBR
++    if (++(ospf->n_extImports) == 1)
++        ospf->rl_orig();
+ }
+ 
+ 
+@@ -94,7 +102,12 @@
+     mask = m->mask;
+     if (!(rte = inrttbl->add(net, mask)))
+ 	return;
+-    exdata = rte->exdata;
++    // Search for entry with same next hop and outgoing
++    // interface
++    for (exdata = rte->exlist; exdata; exdata = exdata->sll_rte) {
++        if (exdata->gw == m->gw && exdata->phyint == m->phyint)
++	    break;
++    }
+     // If delete, free to heap
+     if (status == DELETE_ITEM) {
+ 	if (exdata)
+@@ -103,13 +116,8 @@
+     }
+ 
+     // Add or modify external route
+-    if (!exdata) {
++    if (!exdata)
+ 	exdata = new ExRtData(net, mask);
+-	rte->exdata = exdata;
+-	exdata->forced = true;
+-	if (++n_extImports == 1)
+-	    rl_orig();
+-    }
+ 
+     if (m->gw) {
+ 	exdata->faddr = fa_tbl->add(m->gw);
+@@ -143,6 +151,7 @@
+ 	exdata->forced = true;
+     }
+     exdata->phyint = m->phyint;
++    exdata->gw = m->gw;
+     exdata->mpath = MPath::create(m->phyint, m->gw);
+     // Routing calculation will schedule the ASE origination
+     // if necessary
+@@ -158,14 +167,31 @@
+ void ExRtData::clear_config()
+ 
+ {
++    ExRtData **prev;
++    ExRtData *ptr;
++
+     // Flush AS-external-LSA
+     cost = LSInfinity;
+     mc = 0;
+     direct = 0;
+     noadv = 1;
++    // Remove from routing table entry
++    for (prev = &rte->exlist; (ptr = *prev); prev = &ptr->sll_rte) {
++        if (ptr == this) {
++	    *prev = sll_rte;
++	    break;
++	}
++    }
+     // Routing calculation will schedule the ASE origination
+     // if necessary
++    rte->exdata = 0;
+     rte->run_external();
++    // If pending origination, OSPF::ase_orig() will delete
++    if (!orig_pending)
++        delete this;
++    // If no longer an ASBR, reissue router-LSA with E-bit clear
++    if (--(ospf->n_extImports) == 0)
++        ospf->rl_orig();
+ }
+ 
+ /* Rate-limit the number of AS-external-LSA originations.
+@@ -286,6 +312,14 @@
+ 
+     rte = exdata->rte;
+     exdata->forced = false;
++
++    // If not used in routing table entry, don't advertise LSA
++    if (exdata != rte->exdata) {
++	if (exdata->cost == LSInfinity)
++	    delete exdata;
++        return;
++    }
++
+     // Select Link State ID
+     if ((olsap = rte->my_ase_lsa()))
+ 	ls_id = olsap->ls_id();
+@@ -300,16 +334,8 @@
+ 
+     length = sizeof(LShdr) + sizeof(ASEhdr);
+     // Originate, reoriginate or flush the LSA
+-    if (exdata->cost == LSInfinity ||
+-	rte->type() != RT_STATIC ||
+-	exdata->noadv != 0) {
++    if (rte->type() != RT_STATIC || exdata->noadv != 0) {
+ 	lsa_flush(olsap);
+-	if (exdata->cost == LSInfinity) {
+-	    rte->exdata = 0;
+-	    delete exdata;
+-	    if (--(ospf->n_extImports) == 0)
+-	        ospf->rl_orig();
+-	}
+ 	return;
+     }
+     if (ospf->OverflowState && rte != default_route) {
+@@ -690,62 +716,100 @@
+     uns32 best_t2cost;
+     uns32 best_tag;
+     byte new_type;
+-    ASextLSA *ourlsa;
++    ExRtData *e;
++
++    exdata = 0;
++    new_type = RT_NONE;
++    best_tag = 0;
++    best_type2 = true;
++    best_path = 0;
++    best_preferred = false;
++    best_t2cost = Infinity;
++    best_cost = Infinity;
+ 
++    // First install any direct or static routes
++    for (e = exlist; e; e = e->sll_rte) {
++	uns32 new_cost;
++	uns32 new_t2cost;
++	RTE *egress;
++	bool preferred;
++	// Valid next hop or outgoing interface?
++        if ((!e->faddr || !e->faddr->valid()) &&
++	    !sys->phy_operational(e->phyint))
++	    continue;
++	if (e->cost == LSInfinity)
++	    continue;
+     // Install direct route?
+-    if (exdata && exdata->direct && sys->phy_operational(exdata->phyint)) {
+-	if (r_type != RT_DIRECT) {
++	if (e->direct) {
++	    if (r_type != RT_DIRECT || r_mpath != e->mpath) {
+ 	    r_type = RT_DIRECT;
+-	    update(exdata->mpath);
++		update(e->mpath);
+ 	    cost = 0;
+ 	    sys_install();
+ 	}
+ 	return;
+-    } else if (r_type == RT_DIRECT) {
+-        declare_unreachable();
+-	sys_install();
+     }
+-
++	// Intra-AS routes take precedence
+     if (intra_AS())
+-	return;
+-
+-    ourlsa = 0;
+-    // If we have information from other source
+-    // Install self-originated LSAs as static routes
+-    if (exdata &&
+-	exdata->cost != LSInfinity &&
+-	((exdata->faddr && exdata->faddr->valid()) || 
+-	 sys->phy_operational(exdata->phyint))) {
+-	new_type = RT_STATIC;
+-	best_tag = exdata->tag;
+-	if ((best_type2 = exdata->type2)) {
+-	    best_t2cost = exdata->cost;
+-	    best_cost = 0;
++	    continue;
++	// Better static route?
++	if (e->faddr && e->faddr->valid()) {
++	    egress = e->faddr;
++	    preferred = e->faddr->area() != BACKBONE;
+ 	}
+ 	else {
+-	    best_t2cost = Infinity;
+-	    best_cost = exdata->cost;
++	    egress = 0;
++	    preferred = true;
+ 	}
+-	if (exdata->faddr && exdata->faddr->valid()) {
+-	    best_path = exdata->faddr->r_mpath;
+-	    best_preferred = exdata->faddr->area() != BACKBONE;
+-	    best_cost += exdata->faddr->cost;
++	if (e->type2) {
++	    new_t2cost = e->cost;
++	    new_cost = (egress ? egress->cost : 0);
+ 	}
+ 	else {
+-	    best_path = exdata->mpath;
+-	    best_preferred = true;
++	    new_t2cost = Infinity;
++	    new_cost = e->cost;
++	    new_cost += (egress ? egress->cost : 0);
+ 	}
++	// Compare against present route
++	if (!e->type2 && best_type2)
++	    goto install_static;
++	else if (e->type2 && !best_type2)
++	    continue;
++	else if (new_t2cost < best_t2cost)
++	    goto install_static;
++	else if (new_t2cost > best_t2cost)
++	    continue;
++	else if (preferred && !best_preferred)
++	    goto install_static;
++	else if (!preferred && best_preferred)
++	    continue;
++	else if (new_cost < best_cost)
++	    goto install_static;
++	else if (new_cost > best_cost)
++	    continue;
++	/* Record a better static route
++	 */
++      install_static:
++	best_t2cost = new_t2cost;
++	best_cost = new_cost;
++	best_type2 = e->type2;
++	best_preferred = preferred;
++	best_tag = e->tag;
++        new_type = RT_STATIC;
++	best_path = egress ? egress->r_mpath : e->mpath;
++	exdata = e;
+     }
+-    else {
+-	new_type = RT_NONE;
+-	best_tag = 0;
+-	best_type2 = false;
+-	best_path = 0;
+-	best_preferred = false;
+-	best_t2cost = Infinity;
+-	best_cost = Infinity;
++
++    // Get rid of old direct routes
++    if (r_type == RT_DIRECT) {
++        declare_unreachable();
++	sys_install();
+     }
+ 
++    // Intra-AS routes take precedence
++    if (intra_AS())
++	return;
++
+     for (lsap = ases; lsap; lsap = (ASextLSA *) lsap->link) {
+ 	uns32 new_cost;
+ 	uns32 new_t2cost;
+@@ -758,10 +822,8 @@
+ 	if (lsap->adv_cost == LSInfinity)
+ 	    continue;
+ 	// External data accounted for above
+-	if (lsap->adv_rtr() == ospf->my_id()) {
+-	    ourlsa = lsap;
++	if (lsap->adv_rtr() == ospf->my_id())
+ 	    continue;
+-	}
+ 	if (lsap->fwd_addr) {
+ 	    if (!lsap->fwd_addr->valid())
+ 		continue;
+@@ -829,6 +891,7 @@
+ 	best_tag = lsap->adv_tag;
+         new_type = (best_type2 ? RT_EXTT2 : RT_EXTT1);
+ 	best_path = egress->r_mpath;
++	exdata = 0;
+     }
+ 
+     // Delete or install new path
+diff -X exclude_files -Nabur ospfd1.24/src/ospf.h ospfd1.25/src/ospf.h
+--- ospfd1.24/src/ospf.h	Thu Jan 25 15:44:22 2001
++++ ospfd1.25/src/ospf.h	Thu Feb  1 10:35:33 2001
+@@ -265,7 +265,7 @@
+     // Version numbers
+     enum {
+ 	vmajor = 1,	// Major version number
+-	vminor = 24,	// Minor version number
++	vminor = 25,	// Minor version number
+     };
+ 
+     // Entry points into the OSPF code
+@@ -337,6 +337,7 @@
+     friend class LeaveQueryTimer;
+     friend class FWDtbl;
+     friend class MPath;
++    friend class ExRtData;
+     friend void lsa_flush(class LSA *);
+     friend void ExRtData::clear_config();
+     friend SpfNbr *GetNextAdj();
+diff -X exclude_files -Nabur ospfd1.24/src/rte.h ospfd1.25/src/rte.h
+--- ospfd1.24/src/rte.h	Thu Jan 25 15:44:22 2001
++++ ospfd1.25/src/rte.h	Thu Feb  1 10:35:33 2001
+@@ -188,6 +188,7 @@
+   public:
+     class summLSA *summs;	// summary-LSAs
+     class ASextLSA *ases;	// AS-external-LSAs
++    class ExRtData *exlist;	// Statically configured routes
+     class ExRtData *exdata;	// When we're importing information
+     byte range:1,		// Configured area address range?
+ 	 ase_orig:1;		// Have we originated an AS-external-LSA?
+@@ -224,6 +225,7 @@
+     summs = 0;
+     ases = 0;
+     exdata = 0;
++    exlist = 0;
+     range = false;
+     ase_orig = false;
+ }
+@@ -355,7 +357,9 @@
+ class ExRtData : public ConfigItem {
+     INrte *rte;		// For this routing table entry
+     int phyint;		// Outgoing interface
++    InAddr gw;		// Next hop
+     class FWDrte *faddr;
++    ExRtData *sll_rte;	// Link in routing table entry
+     ExRtData *sll_pend;	// Pending list forward pointer
+     int	type2:1,	// external type, 1 or 2
+ 	mc:1,		// Multicast source?
+diff -X exclude_files -Nabur ospfd1.24/src/spfcalc.C ospfd1.25/src/spfcalc.C
+--- ospfd1.24/src/spfcalc.C	Thu Jan 25 15:44:22 2001
++++ ospfd1.25/src/spfcalc.C	Thu Feb  1 10:35:33 2001
+@@ -814,7 +814,7 @@
+ 
+     ase_sched = false;
+     while ((rte = iter.nextrte())) {
+-	if (rte->ases || rte->exdata)
++	if (rte->ases || rte->exlist)
+ 	    rte->run_external();
+     }
+     // Clear multicast cache
+diff -X exclude_files -Nabur ospfd1.24/src/timer.C ospfd1.25/src/timer.C
+--- ospfd1.24/src/timer.C	Thu Jan 25 15:44:22 2001
++++ ospfd1.25/src/timer.C	Thu Feb  1 10:35:33 2001
+@@ -29,7 +29,7 @@
+  * Used to jitter timers.
+  */
+ 
+-static int Timer::random_period(int period)
++int Timer::random_period(int period)
+ 
+ {
+     float fperiod = period;

@@ -1,0 +1,12 @@
+diff -abur --exclude-from=exclude_files ospfd1.4/src/ospf.h ospfd1.5/src/ospf.h
+--- ospfd1.4/src/ospf.h	Thu May 11 16:53:03 2000
++++ ospfd1.5/src/ospf.h	Wed May 24 11:00:30 2000
+@@ -33,7 +33,7 @@
+ 
+ // Local LSA origination rate limiting
+ 
+-class LocalOrigTimer : public Timer {
++class LocalOrigTimer : public ITimer {
+   public:
+     virtual void action();
+ };

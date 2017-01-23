@@ -1,0 +1,280 @@
+diff -Nabur --exclude-from=exclude_files ospfd1.12/linux/ospfd_linux.C ospfd1.13/linux/ospfd_linux.C
+--- ospfd1.12/linux/ospfd_linux.C	Wed Aug 23 16:20:01 2000
++++ ospfd1.13/linux/ospfd_linux.C	Thu Sep  7 17:17:14 2000
+@@ -58,6 +58,7 @@
+ }
+ void quit(int)
+ {
++    ospfd_sys->changing_routerid = false;
+     ospf->shutdown(10);
+ }
+ void reconfig(int)
+@@ -141,6 +142,8 @@
+ 	    syslog(LOG_ERR, "select failed %m");
+ 	    exit(1);
+ 	}
++	// Check for change of Router ID
++	ospfd_sys->process_routerid_change();
+ 	// Update elapsed time
+ 	ospfd_sys->time_update();
+ 	// Block signals in OSPF code
+@@ -272,6 +275,8 @@
+     next_phyint = 0;
+     memset(phys, 0, sizeof(phys));
+     (void) gettimeofday(&last_time, NULL);
++    changing_routerid = false;
++    change_complete = false;
+     // Allow core files
+     rlim.rlim_max = RLIM_INFINITY;
+     (void) setrlimit(RLIMIT_CORE, &rlim);
+@@ -347,6 +352,10 @@
+     int namlen;
+     char *filename;
+ 
++    // In process of changing router ID?
++    if (changing_routerid)
++        return;
++
+     new_router_id = 0;
+     interp = Tcl_CreateInterp();
+     // Install C-language TCl commands
+@@ -375,11 +384,19 @@
+ 	syslog(LOG_ERR, "Error in config file, line %d", interp->errorLine);
+ 	return;
+     }
+-    // Verify new router ID
+-    if (!ospf || ospf->my_id() != new_router_id) {
++    // Verify router ID was given
++    if (!ospf ||  new_router_id == 0) {
+ 	syslog(LOG_ERR, "Failed to set Router ID");
+ 	return;
+     }
++
++    // Request to change OSPF Router ID?
++    if (ospf->my_id() != new_router_id) {
++        changing_routerid = true;
++	ospf->shutdown(10);
++	return;
++    }
++
+     // Reset current config
+     ospf->cfgStart();
+     // Download new config
+@@ -387,6 +404,25 @@
+     Tcl_DeleteInterp(interp);
+     // Signal configuration complete
+     ospf->cfgDone();
++}
++
++/* Complete the changing of the OSPF Router ID.
++ */
++
++void LinuxOspfd::process_routerid_change()
++
++{
++    if (changing_routerid && change_complete) {
++        changing_routerid = false;
++	change_complete = false;
++	delete ospf;
++	ospf = 0;
++	read_config();
++	if (!ospf) {
++	    syslog(LOG_ERR, "Router ID change failed");
++	    exit(1);
++	}
++    }
+ }
+ 
+ /* Find the physical interface to which a given address
+diff -Nabur --exclude-from=exclude_files ospfd1.12/linux/ospfd_linux.h ospfd1.13/linux/ospfd_linux.h
+--- ospfd1.12/linux/ospfd_linux.h	Wed Aug 23 16:20:01 2000
++++ ospfd1.13/linux/ospfd_linux.h	Thu Sep  7 17:17:14 2000
+@@ -34,6 +34,8 @@
+     class BSDPhyInt *phys[MAXIFs];
+     rtentry m;
+     FILE *logstr;
++    bool changing_routerid;
++    bool change_complete;
+   public:
+     LinuxOspfd();
+     ~LinuxOspfd();
+@@ -65,8 +67,10 @@
+     int get_phyint(InAddr);
+     bool parse_interface(char *, in_addr &, BSDPhyInt * &);
+     void raw_receive(int fd);
++    void process_routerid_change();
+     friend int main(int argc, char *argv[]);
+     friend int SendInterface(void *,struct Tcl_Interp *, int,char *[]);
++    friend void quit(int);
+ };
+ 
+ /* Representation of a physical interface.
+diff -Nabur --exclude-from=exclude_files ospfd1.12/linux/system.C ospfd1.13/linux/system.C
+--- ospfd1.12/linux/system.C	Wed Aug 23 16:20:01 2000
++++ ospfd1.13/linux/system.C	Thu Sep  7 17:17:14 2000
+@@ -437,6 +437,8 @@
+     syslog(LOG_ERR, "Exiting: %s, code %d", string, code);
+     if (code !=  0)
+ 	abort();
++    else if (changing_routerid)
++        change_complete = true;
+     else
+         exit(0);
+ }
+diff -Nabur --exclude-from=exclude_files ospfd1.12/src/ospf.C ospfd1.13/src/ospf.C
+--- ospfd1.12/src/ospf.C	Wed Aug 23 16:20:01 2000
++++ ospfd1.13/src/ospf.C	Thu Sep  7 17:17:14 2000
+@@ -128,6 +128,57 @@
+     spflog(CFG_START, 5);
+ }
+ 
++/* Destructor for the OSPF class. Called when shutting
++ * OSPF down, or when changing the OSPF Router ID.
++ * Reconfigure OSPF to have a NULL configuration, which will
++ * free all areas, interfaces, etc. Then clear all the
++ * global data structures (defined at the top of this file).
++ * Finally, free data that was allocated in the ospf class
++ * itself.
++ */
++
++OSPF::~OSPF()
++
++{
++    // Reset current config
++    cfgStart();
++    // Signal configuration complete
++    cfgDone();
++
++    // Clean out global data structures
++    Timer *tqelt;
++    while ((tqelt = (Timer *) timerq.priq_rmhead())) {
++        ; // Don't delete, as some aren't allocated
++    }
++    inrttbl->root.clear();
++    fa_tbl->root.clear();
++    default_route = 0;
++    cfglist = 0;
++    MPath::nhdb.clear();
++
++    // Free memory allocated by OSPF class
++    extLSAs.clear();
++    ASBRtree.clear();
++    dna_flushq.clear();
++    delete [] build_area;
++    delete [] orig_buff;
++    delete [] mon_buff;
++    phyints.clear();
++    replied_list.clear();
++    MaxAge_list.clear();
++    dbcheck_list.clear();
++    ospfd_membership.clear();
++    local_membership.clear();
++    multicast_cache.clear();
++    ospf_freepkt(&o_update);
++    ospf_freepkt(&o_demand_upd);
++
++    // Reinitialize statics
++    for (int i= 0; i < MaxAge+1; i++)
++        LSA::AgeBins[i] = 0;
++    LSA::Bin0 = 0;
++}
++
+ /* Configure global OSPF parameters. Certain parameter
+  * changes cause us to take extra actions.
+  */
+diff -Nabur --exclude-from=exclude_files ospfd1.12/src/ospf.h ospfd1.13/src/ospf.h
+--- ospfd1.12/src/ospf.h	Wed Aug 23 16:20:01 2000
++++ ospfd1.13/src/ospf.h	Thu Sep  7 17:17:14 2000
+@@ -263,6 +263,7 @@
+ 
+     // Entry points into the OSPF code
+     OSPF(uns32 rtid);
++    ~OSPF();
+     void rxpkt(int phyint, InPkt *pkt, int plen);
+     int	timeout();
+     void tick();
+diff -Nabur --exclude-from=exclude_files ospfd1.12/src/pat.C ospfd1.13/src/pat.C
+--- ospfd1.12/src/pat.C	Wed Aug 23 16:20:01 2000
++++ ospfd1.13/src/pat.C	Thu Sep  7 17:17:14 2000
+@@ -31,6 +31,17 @@
+ PatTree::PatTree()
+ 
+ {
++    init();
++}
++
++/* Initialization performed in a function other
++ * than the constructor, so that the object can be 
++ * reconstructed later.
++ */
++
++void PatTree::init()
++
++{
+     root = new PatEntry;
+     root->zeroptr = root;
+     root->oneptr = root;
+@@ -193,4 +204,29 @@
+     size--;
+ }
+ 
++/* Clear the entire Patricia tree. This is a recursive
++ * operation, which deletes all the nodes.
++ */
++
++void PatTree::clear()
+ 
++{
++    clear_subtree(root);
++    init();
++}
++
++/* Clear the subtree rooted at the given entry.
++ * Works recursively.
++ */
++
++void PatTree::clear_subtree(PatEntry *entry)
++
++{
++    if (!entry)
++        return;
++    if (entry->zeroptr && entry->zeroptr->chkbit > entry->chkbit)
++        clear_subtree(entry->zeroptr);
++    if (entry->oneptr && entry->oneptr->chkbit > entry->chkbit)
++        clear_subtree(entry->oneptr);
++    delete entry;
++}
+diff -Nabur --exclude-from=exclude_files ospfd1.12/src/pat.h ospfd1.13/src/pat.h
+--- ospfd1.12/src/pat.h	Wed Aug 23 16:20:01 2000
++++ ospfd1.13/src/pat.h	Thu Sep  7 17:17:14 2000
+@@ -71,8 +71,11 @@
+     int	size;
+   public:
+     PatTree();
++    void init();
+     void add(PatEntry *);
+     PatEntry *find(byte *key, int keylen);
+     PatEntry *find(char *key);
+     void remove(PatEntry *);
++    void clear();
++    void clear_subtree(PatEntry *);
+ };
+diff -Nabur --exclude-from=exclude_files ospfd1.12/src/rte.h ospfd1.13/src/rte.h
+--- ospfd1.12/src/rte.h	Wed Aug 23 16:20:01 2000
++++ ospfd1.13/src/rte.h	Thu Sep  7 17:17:14 2000
+@@ -71,6 +71,7 @@
+     inline INrte *find(uns32 net, uns32 mask);
+     INrte *best_match(uns32 addr);
+     friend class INiterator;
++    friend class OSPF;
+ };
+ 
+ inline INrte *INtbl::find(uns32 net, uns32 mask)
+@@ -394,6 +395,7 @@
+     FWDrte *add(uns32 addr);
+     void resolve();
+     void resolve(INrte *changed_rte);
++    friend class OSPF;
+ };
+ 
+ class FWDrte : public RTE {
